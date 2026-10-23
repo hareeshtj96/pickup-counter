@@ -1,0 +1,92 @@
+# Local development stack: PostgreSQL + Express API + Vite dev server.
+# Start everything with:  docker compose up --build
+#
+# Values come from .env when present; otherwise the local-only defaults after
+# ":-" are used. These defaults are NOT secrets and must never be used in
+# production.
+
+name: pickup-counter
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pickup}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pickup_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-pickup_counter}
+    ports:
+      # Host port 5433 by default so it does not clash with a locally installed
+      # PostgreSQL on 5432. Containers still use db:5432 internally.
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      # Named volume: data survives `docker compose down` (use `down -v` to wipe it).
+      - pgdata:/var/lib/postgresql/data
+      # Runs once, on first start with an empty volume: creates the test database.
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      target: dev
+    init: true
+    environment:
+      NODE_ENV: development
+      PORT: 4000
+      # "db" is the Compose service name, resolved by Docker's internal DNS.
+      DATABASE_URL: postgres://${POSTGRES_USER:-pickup}:${POSTGRES_PASSWORD:-pickup_dev_password}@db:5432/${POSTGRES_DB:-pickup_counter}
+      TEST_DATABASE_URL: postgres://${POSTGRES_USER:-pickup}:${POSTGRES_PASSWORD:-pickup_dev_password}@db:5432/pickup_counter_test
+      CHOKIDAR_USEPOLLING: "true"
+    ports:
+      - "${BACKEND_HOST_PORT:-4000}:4000"
+    volumes:
+      - ./backend/src:/app/src
+      - ./backend/tests:/app/tests
+      - ./backend/migrations:/app/migrations
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:4000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    stop_grace_period: 15s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    init: true
+    environment:
+      # Server-side only (no VITE_ prefix): where the Vite dev server proxies /api.
+      API_PROXY_TARGET: http://backend:4000
+      CHOKIDAR_USEPOLLING: "true"
+    ports:
+      - "${FRONTEND_HOST_PORT:-5173}:5173"
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/index.html:/app/index.html
+      - ./frontend/vite.config.ts:/app/vite.config.ts
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:5173/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    stop_grace_period: 10s
+    restart: unless-stopped
+
+volumes:
+  pgdata:

@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+*.log
+*.tsbuildinfo
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/
