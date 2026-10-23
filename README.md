@@ -10,7 +10,7 @@ A full-stack TypeScript application for ordering items for counter pickup.
 | Tests    | Vitest + Supertest against a real PostgreSQL DB |
 | Runtime  | Docker + Docker Compose                        |
 
-**Status:** Phase 1 (foundation) is complete. Products, orders, payments and pickup are not built yet.
+**Status:** Phase 1 (foundation) and Phase 2 (product catalog) are complete. Orders, reservations, payments and pickup are not built yet.
 
 ---
 
@@ -41,6 +41,7 @@ docker compose ps                              # db, backend, frontend all "heal
 curl -i http://localhost:4000/health           # 200 {"status":"ok","database":"up",...}
 curl -i http://localhost:4000/api/health       # 200 (same, under /api)
 curl -i http://localhost:5173/api/health       # 200, via the Vite proxy (frontend -> backend)
+curl -i http://localhost:4000/products         # 200 {"products":[...5 seeded snacks...]}
 docker compose exec backend npm test           # integration tests on pickup_counter_test
 ```
 
@@ -68,7 +69,7 @@ Browser ──► frontend (Vite :5173) ──/api proxy──► backend (Expre
 ### Startup order and readiness
 
 1. `db` starts. Its health check (`pg_isready`) passes once Postgres accepts connections.
-2. `backend` waits for `db` to be **healthy**, applies pending migrations, then starts the API. Its health check calls `GET /health`, which runs `SELECT 1`.
+2. `backend` waits for `db` to be **healthy**, applies pending migrations, inserts any missing development products (idempotent seed), then starts the API. Its health check calls `GET /health`, which runs `SELECT 1`.
 3. `frontend` waits for `backend` to be **healthy**.
 
 ### Shutdown
@@ -89,7 +90,7 @@ backend/
     config/env.ts          Zod-validated environment variables
     db/pool.ts             Shared pg connection pool
     db/migrate.ts          Migration runner
-    db/seed.ts             Seed data (empty until Phase 2)
+    db/seed.ts             Idempotent development seed (5 snacks) + safety guard
     db/cli/                `npm run migrate` / `npm run seed` entry points
     routes/                URL -> controller wiring
     controllers/           HTTP layer: read request, call service, send response
@@ -100,6 +101,58 @@ backend/
 ```
 
 Request flow: `route → validate middleware → controller → service → PostgreSQL`. Errors go to `errorHandler`.
+
+Every route is served both under `/api` (what the frontend calls) and at the root (`/health`, `/products`).
+
+---
+
+## API
+
+### `GET /products`
+
+Lists the catalog, sorted by name.
+
+```json
+{
+  "products": [
+    { "id": "a1b2c3d4-0005-4000-8000-000000000005", "name": "Chocolate Brownie", "pricePaise": 6000, "availableUnits": 12 }
+  ]
+}
+```
+
+| Field            | Meaning |
+| ---------------- | ------- |
+| `id`             | Product UUID |
+| `name`           | Display name |
+| `pricePaise`     | Price in **integer paise** (6000 = Rs 60.00). The frontend formats it for display; the backend never converts to rupees. |
+| `availableUnits` | Units a customer can still buy. In Phase 2 this equals `stock_quantity`; from Phase 3 it will subtract active reservations. |
+
+An empty catalog returns `{ "products": [] }` with status 200.
+
+## Database schema
+
+`products` (migration `0002_create_products.sql`):
+
+| Column           | Type          | Rules |
+| ---------------- | ------------- | ----- |
+| `id`             | `UUID`        | Primary key, `gen_random_uuid()` default |
+| `name`           | `TEXT`        | Not blank, at most 120 chars, unique ignoring case |
+| `price_paise`    | `INTEGER`     | `> 0` |
+| `stock_quantity` | `INTEGER`     | `>= 0`. Total physical units on hand |
+| `created_at`     | `TIMESTAMPTZ` | Default `now()` |
+| `updated_at`     | `TIMESTAMPTZ` | Maintained by a `BEFORE UPDATE` trigger |
+
+The rules are enforced by PostgreSQL itself, so invalid data is rejected no matter which code path writes it.
+
+## Seeding
+
+```bash
+docker compose exec backend npm run seed
+```
+
+- Inserts 5 snacks with fixed UUIDs using `ON CONFLICT DO NOTHING`. Running it again inserts nothing and **never overwrites** existing rows, so live stock levels are safe.
+- Refuses to run when `NODE_ENV=production`, or when the connected database (checked with `current_database()`) is not `pickup_counter` or a name ending in `_dev` or `_test`.
+- The Docker dev container runs it automatically on startup.
 
 ### Error format
 
@@ -150,7 +203,11 @@ npm install && npm run dev        # proxies /api to http://localhost:4000 by def
 
 ### Tests
 
-Tests use a **real PostgreSQL database** named `pickup_counter_test`. It is created automatically the first time the `db` volume is initialised (`docker/postgres/init/01-create-test-db.sql`). The test config refuses to run unless the database name ends in `_test`, so tests can never wipe development data.
+Tests use a **real PostgreSQL database** named `pickup_counter_test`. It is created automatically the first time the `db` volume is initialised (`docker/postgres/init/01-create-test-db.sql`).
+
+- Before each run, `tests/globalSetup.ts` drops and recreates the test schema, then runs all migrations. Every run therefore proves the migrations work on a fresh database.
+- Tests that need a clean slate call `resetDomainTables()`. It empties **every** application table in one `TRUNCATE`, so foreign keys between tables never block cleanup and future tables are covered automatically. `schema_migrations` is kept.
+- Constraint tests run inside transactions that are always rolled back.
 
 ```bash
 # Inside Docker (TEST_DATABASE_URL is already set):
@@ -160,8 +217,53 @@ docker compose exec backend npm test
 TEST_DATABASE_URL=postgres://pickup:pickup_dev_password@localhost:5433/pickup_counter_test npm test
 ```
 
-> If your `db` volume was created before the init script existed, create the test DB once:
-> `docker compose exec db psql -U pickup -d pickup_counter -c "CREATE DATABASE pickup_counter_test;"`
+#### Test database safety
+
+The test setup drops the whole `public` schema, so it is guarded in layers (`tests/helpers/testDatabase.ts`). Any failed check stops the run **before** destructive SQL is sent.
+
+1. **Explicit configuration.** `TEST_DATABASE_URL` must be set. There is never a fallback to `DATABASE_URL`.
+2. **Expected target**, checked before connecting:
+   - The scheme must be `postgres://` or `postgresql://`.
+   - The database name must be exactly `pickup_counter_test`.
+   - The host:port must be `db:5432` (inside Docker) or `localhost` / `127.0.0.1` / `[::1]` on `POSTGRES_HOST_PORT` (default 5433).
+   - The URL must have no query parameters, because `?host=` could silently redirect the connection.
+3. **Marker.** On the same connection that will run the destructive SQL, `current_database()` must be `pickup_counter_test`. The database must also carry the comment `pickup-counter:disposable-test-database`. The init script sets this comment when it creates the database. It lives in the server catalog, so it survives the schema reset.
+4. **Test-run lock.** `globalSetup` keeps one dedicated connection open in the main Vitest process and holds `pg_try_advisory_lock(727002)` on it until the final teardown.
+   - A second, overlapping run fails immediately with "Another test run is using the test database".
+   - If a run crashes, its connection closes and PostgreSQL releases the lock automatically.
+
+Error messages name the target as `host:port/database` only, never the credentials.
+
+**One-time setup for volumes created before the marker existed.** Run this if tests stop with *"is not marked as a disposable test database"*. It only adds the comment, and no data changes:
+
+```bash
+docker compose exec db psql -U pickup -d postgres \
+  -c "COMMENT ON DATABASE pickup_counter_test IS 'pickup-counter:disposable-test-database'"
+```
+
+If the test database does not exist at all (a very old volume), create it first:
+`docker compose exec db psql -U pickup -d postgres -c "CREATE DATABASE pickup_counter_test"`.
+
+Only ever put this marker on a database whose contents may be destroyed.
+
+### Changing the database password
+
+PostgreSQL reads `POSTGRES_USER`, `POSTGRES_PASSWORD` and `POSTGRES_DB` **only when the data volume is first created**. Changing them later, for example by adding a `.env` with a different password, does **not** change the existing database. The backend then gets `password authentication failed for user "pickup"` (error `28P01`) and stays unhealthy.
+
+The local default is `pickup_dev_password` everywhere: Compose defaults, `.env.example` and the README. If login fails, recover without deleting data. Choose **one** of these:
+
+- **Go back to the password the volume was created with.** Remove the changed `POSTGRES_PASSWORD` from `.env`, or set it back.
+- **Change the stored password to match your `.env`.** Connections from inside the `db` container use local trust auth, so no old password is needed:
+  ```bash
+  docker compose exec db psql -U pickup -d postgres -c "ALTER ROLE pickup PASSWORD 'your_new_password'"
+  docker compose up -d backend
+  ```
+
+`docker compose down -v` also "fixes" it, but it **deletes all data**. Use it only when you want an empty database.
+
+### Port 5433 conflicts on the host
+
+Inside Docker the backend always uses `db:5432`, so this only affects tools running on your machine. If another PostgreSQL on your machine also listens on 5433, `localhost:5433` may reach that server instead of the Compose database. You will typically see `28P01`. The marker check above still refuses to reset an unmarked database there. To use a free port, set `POSTGRES_HOST_PORT` (for example `5434`) in `.env`, run `docker compose up -d db`, and use the same port in `TEST_DATABASE_URL` and `DATABASE_URL`.
 
 ---
 
@@ -179,6 +281,13 @@ TEST_DATABASE_URL=postgres://pickup:pickup_dev_password@localhost:5433/pickup_co
 | 8 | Postgres published on host port **5433** | Avoids clashing with a locally installed PostgreSQL on 5432. |
 | 9 | Compose has local-only fallback credentials | `docker compose up --build` works on a fresh clone; real secrets never live in the repo. |
 | 10 | Integration tests run against a dedicated `_test` database, files run sequentially | Real DB behaviour (locks, constraints) without risking dev data. |
+| 11 | `price_paise` and `stock_quantity` are `INTEGER`, not `BIGINT` | node-postgres returns `BIGINT` as a string; `INTEGER` arrives as a JS number and holds up to about Rs 2.1 crore. |
+| 12 | Data rules live in DB `CHECK` constraints and a unique index on `lower(name)` | The database is the last line of defence, whatever code writes to it. |
+| 13 | `availableUnits` is computed in SQL in `products.service.ts` | Phase 3 changes it to "stock minus active reservations" in one place. |
+| 14 | Seed uses fixed UUIDs + `ON CONFLICT DO NOTHING` and a database-name guard | Repeatable, never clobbers live stock, cannot seed an arbitrary database. |
+| 15 | `GET /products` returns `{ "products": [...] }`, not a bare array | Room to add fields (e.g. pagination) later without breaking clients. |
+| 16 | Test DB guarded by config allow-list + database-comment marker + verified connection + session advisory lock held for the whole run | Defence in depth: a wrong URL, wrong server, unmarked DB or overlapping run all fail before any destructive SQL. |
+| 17 | One local default password (`pickup_dev_password`) in Compose and `.env.example`, checked by `tests/config.test.ts` | Copying `.env.example` must never lock the backend out of an existing volume. |
 
 ## Security notes
 

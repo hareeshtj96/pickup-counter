@@ -6,9 +6,10 @@ RUN npm ci
 COPY . .
 ENV NODE_ENV=development
 EXPOSE 4000
-# Apply pending migrations, then start the API with live reload.
+# Apply pending migrations, insert any missing development products (idempotent),
+# then start the API with live reload.
 # `exec` makes the API process receive SIGTERM directly for graceful shutdown.
-CMD ["sh", "-c", "node_modules/.bin/tsx src/db/cli/migrate.ts && exec node_modules/.bin/tsx watch src/server.ts"]
+CMD ["sh", "-c", "node_modules/.bin/tsx src/db/cli/migrate.ts && node_modules/.bin/tsx src/db/cli/seed.ts && exec node_modules/.bin/tsx watch src/server.ts"]
 
 # ---- build: compile TypeScript ----
 FROM node:22-alpine AS build

@@ -1,17 +1,17 @@
 import { Router } from 'express';
 import { healthRouter } from './health.routes.js';
+import { productsRouter } from './products.routes.js';
 
 export function createRouter(): Router {
+  const routes = Router();
+  routes.use('/health', healthRouter);
+  routes.use('/products', productsRouter);
+
+  // The frontend calls everything under /api (proxied by Vite). The same routes
+  // are also served at the root, e.g. GET /health for Docker health checks and
+  // GET /products as specified.
   const router = Router();
-
-  // Used by Docker health checks and monitoring.
-  router.use('/health', healthRouter);
-
-  // Everything the frontend calls lives under /api. Feature routers
-  // (products, orders, ...) will be mounted here in later phases.
-  const api = Router();
-  api.use('/health', healthRouter);
-  router.use('/api', api);
-
+  router.use('/api', routes);
+  router.use(routes);
   return router;
 }

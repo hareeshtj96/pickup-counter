@@ -44,12 +44,18 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-pickup}:${POSTGRES_PASSWORD:-pickup_dev_password}@db:5432/${POSTGRES_DB:-pickup_counter}
       TEST_DATABASE_URL: postgres://${POSTGRES_USER:-pickup}:${POSTGRES_PASSWORD:-pickup_dev_password}@db:5432/pickup_counter_test
       CHOKIDAR_USEPOLLING: "true"
+      # Lets the config-consistency test read the files mounted below.
+      PROJECT_ROOT: /project
     ports:
       - "${BACKEND_HOST_PORT:-4000}:4000"
     volumes:
       - ./backend/src:/app/src
       - ./backend/tests:/app/tests
       - ./backend/migrations:/app/migrations
+      # Mounted so test-safety changes apply without rebuilding the image.
+      - ./backend/vitest.config.ts:/app/vitest.config.ts:ro
+      - ./docker-compose.yml:/project/docker-compose.yml:ro
+      - ./.env.example:/project/.env.example:ro
     depends_on:
       db:
         condition: service_healthy
