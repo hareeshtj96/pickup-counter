@@ -27,7 +27,11 @@ describe('migration runner (real PostgreSQL)', () => {
     const { rows } = await pool.query<{ name: string }>(
       'SELECT name FROM schema_migrations ORDER BY name',
     );
-    expect(rows.map((row) => row.name)).toEqual(['0001_baseline.sql', '0002_create_products.sql']);
+    expect(rows.map((row) => row.name)).toEqual([
+      '0001_baseline.sql',
+      '0002_create_products.sql',
+      '0003_create_orders.sql',
+    ]);
   });
 
   it('is idempotent and safe to run concurrently', async () => {

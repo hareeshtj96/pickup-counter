@@ -17,12 +17,13 @@ type ProductRow = {
 };
 
 export async function listProducts(): Promise<Product[]> {
-  // Phase 2: nothing is reserved yet, so every unit in stock is available.
-  // Phase 3 will subtract active reservations here, in SQL.
+  // Physical stock minus active reservations (unexpired pending + paid,
+  // uncollected orders), as defined once in the product_availability view.
   const { rows } = await pool.query<ProductRow>(
-    `SELECT id, name, price_paise, stock_quantity AS available_units
-       FROM products
-      ORDER BY name ASC, id ASC`,
+    `SELECT p.id, p.name, p.price_paise, a.available_units
+       FROM products p
+       JOIN product_availability a ON a.product_id = p.id
+      ORDER BY p.name ASC, p.id ASC`,
   );
 
   return rows.map((row) => ({

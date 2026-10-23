@@ -183,7 +183,7 @@ describe('destructive helpers refuse unverified databases', () => {
         `SELECT (SELECT count(*)::int FROM products) AS products,
                 (SELECT count(*)::int FROM schema_migrations) AS migrations`,
       );
-      expect(rows[0]).toEqual({ products: 0, migrations: 2 });
+      expect(rows[0]).toEqual({ products: 0, migrations: 3 });
     });
   });
 });

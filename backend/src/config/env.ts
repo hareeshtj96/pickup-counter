@@ -12,6 +12,8 @@ const envSchema = z.object({
     .refine((value) => /^postgres(ql)?:\/\//.test(value), 'must be a postgres:// URL'),
   DB_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().min(1000).default(10_000),
+  // How often the API persists 'expired' for overdue unpaid orders.
+  ORDER_EXPIRY_SWEEP_INTERVAL_MS: z.coerce.number().int().min(1000).default(15_000),
 });
 
 export type Env = z.infer<typeof envSchema>;

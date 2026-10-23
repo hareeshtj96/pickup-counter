@@ -14,6 +14,9 @@ export default defineConfig({
     env: {
       NODE_ENV: 'test',
       DATABASE_URL: testDatabase.url,
+      // The concurrency test holds 10 simultaneous order transactions open;
+      // leave headroom for the test's own queries.
+      DB_POOL_MAX: '20',
     },
     globalSetup: ['tests/globalSetup.ts'],
     setupFiles: ['tests/setup.ts'],

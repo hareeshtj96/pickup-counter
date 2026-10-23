@@ -1,8 +1,10 @@
 import { createApp } from './app.js';
 import { env } from './config/env.js';
 import { closePool } from './db/pool.js';
+import { startExpirySweeper } from './jobs/expirySweeper.js';
 
 const app = createApp();
+const stopExpirySweeper = startExpirySweeper(env.ORDER_EXPIRY_SWEEP_INTERVAL_MS);
 
 const server = app.listen(env.PORT, () => {
   console.log(`API listening on port ${env.PORT} (${env.NODE_ENV})`);
@@ -28,6 +30,7 @@ function shutdown(signal: NodeJS.Signals): void {
   }, env.SHUTDOWN_TIMEOUT_MS);
   forceExit.unref();
 
+  stopExpirySweeper();
   server.close((serverErr) => {
     closePool()
       .then(() => {
