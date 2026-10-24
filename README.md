@@ -10,7 +10,13 @@ A full-stack TypeScript application for ordering items for counter pickup.
 | Tests    | Vitest + Supertest against a real PostgreSQL DB |
 | Runtime  | Docker + Docker Compose                        |
 
-**Status:** Phase 1 (foundation), Phase 2 (product catalog), Phase 3 (orders with 120-second stock reservations) Phase 4 (signed, idempotent payment webhook) and Phase 5 (pickup collection with exactly-once stock deduction) are complete. The frontend pickup/checkout UI is not built yet.
+**Status:** Phases 1–6 are complete:
+- foundation
+- product catalog
+- orders with 120-second stock reservations
+- signed, idempotent payment webhook
+- pickup collection with exactly-once stock deduction
+- the React frontend for the whole flow
 
 ---
 
@@ -50,7 +56,47 @@ curl -i -X POST http://localhost:4000/orders/<id>/collect   # 200, collected; ph
 docker compose exec backend npm test           # integration tests on pickup_counter_test
 ```
 
-Open http://localhost:5173. The page should show **API: ok · Database: up**.
+Open http://localhost:5173. You should see the snack catalog. See [Frontend](#frontend) for the full walkthrough.
+
+## Frontend
+
+React + Vite + TypeScript, with no UI library. The browser only calls `/api/...`, and the Vite dev server proxies those calls to the backend (`API_PROXY_TARGET`). **The backend is the source of truth for everything.** The page shows what the server returns and never decides prices, stock or status itself.
+
+**Flow at http://localhost:5173:**
+1. **Catalog** (`GET /products`): each product shows its name, its price formatted from integer paise (for example `₹1,23,456.78`, using integer arithmetic only), and its available units.
+   - Quantity steppers are capped at `min(available, 20)`. Sold-out products are disabled.
+   - The estimated total is labelled as an estimate; the server sets the real one.
+2. **Reserve** (`POST /orders`): sends only `{ items: [{ productId, quantity }] }`.
+   - The button is disabled and reads "Reserving…" while the request is in flight, so double submits are ignored.
+   - A `409 INSUFFICIENT_STOCK` names the product and how many are left, and the catalog is re-fetched.
+   - Validation, busy (503) and network errors are explained in plain language.
+3. **Order panel** (`GET /orders/:id`): shows the order ID, a status label with next-step guidance, the items, the total, and a countdown.
+   - The countdown starts from the server's `expiresInSeconds`, so the device clock doesn't matter.
+   - The order ID lives in the URL (`#/orders/<id>`), so a reload or a shared link reopens it. Nothing is stored in the browser.
+   - You can also open any order by ID.
+4. **Status polling:** only while the order is `pending`, every 5 s, never two requests at once. Polling stops on `paid`, `expired`, `needs_review` or `collected`, and when the view closes. When the countdown reaches zero, the order is re-checked with the server at once.
+5. **Simulate payment** (pending orders only, development only): see below. The status changes to "Paid" only after `GET /orders/:id` confirms it.
+6. **Staff: confirm pickup** (paid orders only; `POST /orders/:id/collect`):
+   - A success message appears only after the server confirms.
+   - `alreadyCollected: true` reads "already collected; no stock deducted again".
+   - `ORDER_NOT_COLLECTABLE`, `INSUFFICIENT_PHYSICAL_STOCK` and `COLLECTION_BUSY` show the server's reason.
+   - The UI states plainly that there is **no staff login or PIN**.
+7. After creating, paying, collecting, or any change of status (including expiry), the catalog is re-fetched. The browser never decrements stock itself.
+
+### Development-only payment simulation
+
+The real payment path is the HMAC-signed webhook. The browser cannot sign it, because it **never has** `PAYMENT_WEBHOOK_SECRET`: that variable is not `VITE_`-prefixed, is not in the frontend container, and is not in the bundle (verified). So the "Simulate payment" button calls a separate **development-only** endpoint:
+
+`POST /dev/orders/:id/simulate-payment` (also under `/api`)
+
+- **It runs the normal payment service** (`processPaymentEvent`), exactly like a signed webhook. That means the order lock, the deadline check made under the lock, `UNIQUE (event_id)` and the `needs_review` rules all still apply.
+  - A late simulated payment becomes `needs_review`.
+  - A second one is `already_paid`.
+- **The server decides everything:** the amount is the order's stored `total_paise` and the event ID is generated server-side (`devsim_<uuid>`). The request takes no body, and any fields sent are rejected with 400.
+- **It only exists when `DEV_PAYMENT_SIMULATOR=true`.** That flag defaults to `false`, and the API refuses to start with it set to `true` when `NODE_ENV=production`. Docker Compose sets it to `true` for local development only. When it is off, the route returns 404 and the UI points you to the signed webhook sender instead.
+- **It moves no real money** and does not test signature verification; the webhook tests cover that.
+
+Anyone who can reach a development API can call this endpoint for any order ID. Never enable it on a shared or public server.
 
 ### Stop
 
@@ -455,6 +501,30 @@ npm install && npm run dev        # proxies /api to http://localhost:4000 by def
 | `npm run build`     | Typecheck + production build  |
 | `npm run typecheck` | `tsc --noEmit`                |
 | `npm run lint`      | ESLint                        |
+| `npm test`          | Component tests (Vitest + jsdom + Testing Library) |
+
+### Frontend tests
+
+```bash
+cd frontend && npm test
+```
+
+Component tests render the real `<App />` in jsdom.
+- HTTP is mocked at the `fetch` level (`src/test/mockApi.ts`), which records each request so the tests can assert exactly what the browser sends.
+- They cover:
+  - catalog loading, error and empty states
+  - quantity limits
+  - order creation (exact request body, no double submit)
+  - `409` stock conflicts and validation errors
+  - all five statuses
+  - polling that stops at a final status
+  - the countdown triggering a re-check at zero
+  - "paid" shown only after `GET /orders/:id` confirms it
+  - late payments
+  - the simulator turned off
+  - collection, including `alreadyCollected`, `ORDER_NOT_COLLECTABLE`, `INSUFFICIENT_PHYSICAL_STOCK` and `COLLECTION_BUSY`
+- Dev dependencies added: `vitest`, `jsdom` and `@testing-library/*`. All are dev-only, so none of them end up in the browser bundle.
+- These tests complement the backend's real-PostgreSQL integration suite; they do not replace it.
 
 ### Tests
 
@@ -561,6 +631,10 @@ Inside Docker the backend always uses `db:5432`, so this only affects tools runn
 | 30 | Repeat collection returns 200 with `alreadyCollected: true` | Idempotent for staff retries and double-clicks; mirrors the webhook's `duplicate: true`. |
 | 31 | Shelf shortage at pickup → 409 `INSUFFICIENT_PHYSICAL_STOCK`, order stays `paid` | A write-off after payment must not silently hand over a partial order; staff resolve it. |
 | 32 | No new migration for Phase 5 | `collected_at` and its `CHECK` constraints already existed (0003); old migrations are never edited. |
+| 33 | Browser "pay" goes through a dev-only server endpoint that calls the normal payment service; the secret never reaches the browser | Client-side signing would leak the secret; a public mark-as-paid endpoint would bypass the payment rules. |
+| 34 | Order ID kept in the URL hash, not localStorage | Survives reloads and can be shared; stores no data in the browser. |
+| 35 | Countdown anchored to the server's `expiresInSeconds` at response time; zero triggers a server re-check | Device clocks are never trusted; the server decides expiry. |
+| 36 | No UI library or state manager; plain React state and hooks | The app has two panels and five endpoints; extra dependencies would add weight without benefit. |
 
 ## Security notes
 

@@ -1,52 +1,40 @@
-import { useEffect, useState } from 'react';
-import { ApiError, apiGet } from './api/client';
-
-type HealthResponse = {
-  status: 'ok' | 'error';
-  database: 'up' | 'down';
-  timestamp: string;
-};
-
-type HealthState =
-  | { kind: 'loading' }
-  | { kind: 'ok'; data: HealthResponse }
-  | { kind: 'error'; message: string };
+import { useEffect, useRef } from 'react';
+import type { Order } from './api/pickup';
+import { Catalog } from './components/Catalog';
+import { OrderPanel } from './components/OrderPanel';
+import { useHashOrderId } from './hooks/useHashOrderId';
+import { useOrder } from './hooks/useOrder';
+import { useProducts } from './hooks/useProducts';
 
 export function App() {
-  const [health, setHealth] = useState<HealthState>({ kind: 'loading' });
+  const catalog = useProducts();
+  const [orderId, trackOrder] = useHashOrderId();
+  const tracked = useOrder(orderId);
 
+  // Whenever the server reports a new status for the tracked order (paid,
+  // expired, collected, …), stock may have changed: re-fetch the catalog.
+  const { refresh: refreshCatalog } = catalog;
+  const status = tracked.order?.status;
+  const lastStatus = useRef(status);
   useEffect(() => {
-    const controller = new AbortController();
-    apiGet<HealthResponse>('/health', { signal: controller.signal })
-      .then((data) => setHealth({ kind: 'ok', data }))
-      .catch((err: unknown) => {
-        if (controller.signal.aborted) return;
-        setHealth({
-          kind: 'error',
-          message: err instanceof ApiError ? err.message : 'Unexpected error.',
-        });
-      });
-    return () => controller.abort();
-  }, []);
+    if (status !== undefined && lastStatus.current !== undefined && status !== lastStatus.current) {
+      refreshCatalog();
+    }
+    lastStatus.current = status;
+  }, [status, refreshCatalog]);
+
+  const handleOrderCreated = (order: Order) => trackOrder(order.id);
 
   return (
-    <main style={{ fontFamily: 'system-ui, sans-serif', padding: '2rem', maxWidth: 640 }}>
-      <h1>Pickup Counter</h1>
-      <p>The frontend is running.</p>
-
-      <h2>Backend status</h2>
-      {health.kind === 'loading' && <p>Checking API…</p>}
-      {health.kind === 'ok' && (
-        <p data-testid="api-status">
-          API: <strong>{health.data.status}</strong> · Database:{' '}
-          <strong>{health.data.database}</strong>
-        </p>
-      )}
-      {health.kind === 'error' && (
-        <p data-testid="api-status" role="alert">
-          API unreachable: {health.message}
-        </p>
-      )}
-    </main>
+    <>
+      <header className="site-header">
+        <h1>Pickup Counter</h1>
+        <p>Reserve snacks, pay within 2 minutes, collect at the counter.</p>
+      </header>
+      <main className="layout">
+        <Catalog catalog={catalog} onOrderCreated={handleOrderCreated} />
+        <OrderPanel orderId={orderId} tracked={tracked} onTrack={trackOrder} onStockChanged={refreshCatalog} />
+      </main>
+    </>
   );
 }

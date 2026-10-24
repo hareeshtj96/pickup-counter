@@ -20,6 +20,7 @@ export default defineConfig({
       // Fixed, test-only key so webhook tests are deterministic and never use
       // a real or development secret.
       PAYMENT_WEBHOOK_SECRET: 'test-only-webhook-secret-for-integration-tests',
+      DEV_PAYMENT_SIMULATOR: 'true',
     },
     globalSetup: ['tests/globalSetup.ts'],
     setupFiles: ['tests/setup.ts'],

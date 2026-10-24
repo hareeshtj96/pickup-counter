@@ -18,8 +18,21 @@ const envSchema = z.object({
   ORDER_EXPIRY_SWEEP_INTERVAL_MS: z.coerce.number().int().min(1000).default(15_000),
   // HMAC-SHA256 key shared with the payment provider. Required; no default.
   PAYMENT_WEBHOOK_SECRET: z.string().min(32, 'must be at least 32 characters'),
+  // Registers POST /dev/orders/:id/simulate-payment for local demos. Off unless
+  // explicitly "true"; refused in production.
+  DEV_PAYMENT_SIMULATOR: z
+    .enum(['true', 'false'], { errorMap: () => ({ message: 'must be "true" or "false"' }) })
+    .default('false')
+    .transform((value) => value === 'true'),
 })
   .superRefine((value, ctx) => {
+    if (value.NODE_ENV === 'production' && value.DEV_PAYMENT_SIMULATOR) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['DEV_PAYMENT_SIMULATOR'],
+        message: 'the development payment simulator cannot be enabled in production',
+      });
+    }
     // The documented local placeholder must never reach production.
     if (value.NODE_ENV === 'production' && value.PAYMENT_WEBHOOK_SECRET.startsWith(DEV_SECRET_PREFIX)) {
       ctx.addIssue({
