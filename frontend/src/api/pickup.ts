@@ -64,8 +64,13 @@ export function getOrder(id: string, signal?: AbortSignal): Promise<Order> {
   return apiGet<Order>(`/orders/${encodeURIComponent(id)}`, { signal });
 }
 
-export function collectOrder(id: string): Promise<CollectResult> {
-  return apiPost<CollectResult>(`/orders/${encodeURIComponent(id)}/collect`);
+/**
+ * Staff pickup claim. Only one claim per order can succeed; a competing or
+ * repeated claim is rejected by the server with 409 ORDER_ALREADY_COLLECTED.
+ */
+export function claimPickup(id: string): Promise<CollectResult> {
+  // The server requires Content-Type: application/json; the body itself is empty.
+  return apiPost<CollectResult>(`/orders/${encodeURIComponent(id)}/pickup-claim`, {});
 }
 
 /**
@@ -74,5 +79,6 @@ export function collectOrder(id: string): Promise<CollectResult> {
  * the server runs its normal payment rules. Returns 404 when disabled.
  */
 export function simulatePayment(id: string): Promise<PaymentResult> {
-  return apiPost<PaymentResult>(`/dev/orders/${encodeURIComponent(id)}/simulate-payment`);
+  // JSON Content-Type with an empty body: the server decides amount and event id.
+  return apiPost<PaymentResult>(`/dev/orders/${encodeURIComponent(id)}/simulate-payment`, {});
 }

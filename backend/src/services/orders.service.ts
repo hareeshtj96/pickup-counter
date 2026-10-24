@@ -1,5 +1,5 @@
 import { pool } from '../db/pool.js';
-import { PG_LOCK_NOT_AVAILABLE, isPgError, rollback } from '../db/transaction.js';
+import { isLockContention, rollback } from '../db/transaction.js';
 import { AppError } from '../errors/AppError.js';
 
 /** How long a new, unpaid order holds its stock. */
@@ -133,7 +133,7 @@ export async function createOrder(items: OrderItemInput[]): Promise<Order> {
     await client.query('COMMIT');
   } catch (err) {
     clientBroken = !(await rollback(client));
-    if (isPgError(err) && err.code === PG_LOCK_NOT_AVAILABLE) {
+    if (isLockContention(err)) {
       throw new AppError(503, 'RESERVATION_BUSY', 'The counter is busy. Please try again.');
     }
     throw err;
@@ -328,7 +328,7 @@ export async function collectOrder(id: string): Promise<CollectResult> {
     }
   } catch (err) {
     clientBroken = !(await rollback(client));
-    if (isPgError(err) && err.code === PG_LOCK_NOT_AVAILABLE) {
+    if (isLockContention(err)) {
       throw new AppError(503, 'COLLECTION_BUSY', 'The order is busy. Please try again.');
     }
     throw err;

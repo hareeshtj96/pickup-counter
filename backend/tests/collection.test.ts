@@ -63,7 +63,8 @@ async function paidOrder(items: { productId: string; quantity: number }[]) {
 }
 
 function collect(orderId: string, target: Parameters<typeof request>[0] = app) {
-  return request(target).post(`/orders/${orderId}/collect`);
+  // The frontend sends Content-Type: application/json with an empty object.
+  return request(target).post(`/orders/${orderId}/collect`).send({});
 }
 
 async function stock(productId: string) {
@@ -126,7 +127,7 @@ describe('POST /orders/:id/collect: success', () => {
       { productId: puff, quantity: 2 },
     ]);
 
-    const res = await request(app).post(`/api/orders/${order.id}/collect`);
+    const res = await request(app).post(`/api/orders/${order.id}/collect`).send({});
 
     expect(res.status).toBe(200);
     expect(await stock(samosa)).toEqual({ stock_quantity: 6, reserved_units: 0, available_units: 6 });
@@ -338,6 +339,61 @@ describe('rollback on failure', () => {
   });
 });
 
+describe('POST /orders/:id/pickup-claim (the route named in the brief)', () => {
+  function claim(orderId: string, target: Parameters<typeof request>[0] = app, prefix = '') {
+    return request(target).post(`${prefix}/orders/${orderId}/pickup-claim`).send({});
+  }
+
+  it('claims a paid order once and deducts its stock', async () => {
+    const samosa = await createProduct('Samosa', 2000, 10);
+    const order = await paidOrder([{ productId: samosa, quantity: 3 }]);
+
+    const res = await claim(order.id, app, '/api');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ id: order.id, status: 'collected', alreadyCollected: false });
+    expect(await stock(samosa)).toEqual({ stock_quantity: 7, reserved_units: 0, available_units: 7 });
+  });
+
+  it('rejects a repeated claim with 409 and does not deduct again', async () => {
+    const samosa = await createProduct('Samosa', 2000, 10);
+    const order = await paidOrder([{ productId: samosa, quantity: 3 }]);
+    await claim(order.id);
+    const collectedAt = (await orderRow(order.id))?.collected_at;
+
+    const again = await claim(order.id);
+
+    expect(again.status).toBe(409);
+    expect(again.body).toEqual({
+      error: {
+        code: 'ORDER_ALREADY_COLLECTED',
+        message: 'This order has already been collected.',
+        details: { status: 'collected' },
+      },
+    });
+    expect((await orderRow(order.id))?.collected_at).toEqual(collectedAt);
+    expect(await stock(samosa)).toEqual({ stock_quantity: 7, reserved_units: 0, available_units: 7 });
+  });
+
+  it('rejects unpaid orders, unknown orders and non-JSON requests', async () => {
+    const samosa = await createProduct('Samosa', 2000, 10);
+    const pending = await createOrder([{ productId: samosa, quantity: 1 }]);
+
+    const unpaid = await claim(pending.id);
+    expect(unpaid.status).toBe(409);
+    expect((unpaid.body as ErrorResponse).error.code).toBe('ORDER_NOT_COLLECTABLE');
+
+    const unknown = await claim('a1b2c3d4-9999-4000-8000-000000000999');
+    expect(unknown.status).toBe(404);
+
+    const paid = await paidOrder([{ productId: samosa, quantity: 1 }]);
+    const bare = await request(app).post(`/orders/${paid.id}/pickup-claim`);
+    expect(bare.status).toBe(415);
+    expect((await orderRow(paid.id))?.status).toBe('paid');
+    expect((await stock(samosa))?.stock_quantity).toBe(10);
+  });
+});
+
 describe('concurrency (real overlapping transactions)', () => {
   let server: http.Server;
   let baseUrl: string;
@@ -376,6 +432,28 @@ describe('concurrency (real overlapping transactions)', () => {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
   }
+
+  // Required by the brief: two pickup claims arrive simultaneously.
+  it('two simultaneous pickup claims: exactly one succeeds, the other gets 409', async () => {
+    const samosa = await createProduct('Samosa', 2000, 10);
+    const order = await paidOrder([{ productId: samosa, quantity: 3 }]);
+    const release = await holdLock('SELECT 1 FROM orders WHERE id = $1 FOR UPDATE', [order.id]);
+
+    const pending = [1, 2].map(() =>
+      request(baseUrl).post(`/orders/${order.id}/pickup-claim`).send({}).then((res) => res),
+    );
+    await waitForBlocked('collect:lock-order', 2); // both claims are inside PostgreSQL at once
+    await release();
+    const results = await Promise.all(pending);
+
+    expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
+    expect(results.find((r) => r.status === 200)?.body).toMatchObject({ status: 'collected' });
+    expect((results.find((r) => r.status === 409)?.body as ErrorResponse).error.code).toBe(
+      'ORDER_ALREADY_COLLECTED',
+    );
+    expect((await orderRow(order.id))?.status).toBe('collected');
+    expect(await stock(samosa)).toEqual({ stock_quantity: 7, reserved_units: 0, available_units: 7 });
+  });
 
   it('two simultaneous collections of one order deduct stock exactly once', async () => {
     const samosa = await createProduct('Samosa', 2000, 10);

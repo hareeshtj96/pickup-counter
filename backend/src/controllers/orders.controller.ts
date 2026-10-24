@@ -25,3 +25,19 @@ export async function postCollectOrder(_req: Request, res: Response): Promise<vo
   // 200 both for the collection and for a repeat (alreadyCollected: true).
   res.json(await collectOrder(params.id));
 }
+
+/**
+ * POST /orders/:id/pickup-claim (the route named in the brief). Same
+ * exactly-once collection as /collect, but only one claim can succeed: a
+ * competing or repeated claim gets 409, and stock is never deducted twice.
+ */
+export async function postPickupClaim(_req: Request, res: Response): Promise<void> {
+  const { params } = (res.locals as { validated: { params: OrderIdParams } }).validated;
+  const result = await collectOrder(params.id);
+  if (result.alreadyCollected) {
+    throw new AppError(409, 'ORDER_ALREADY_COLLECTED', 'This order has already been collected.', {
+      status: 'collected',
+    });
+  }
+  res.json(result);
+}

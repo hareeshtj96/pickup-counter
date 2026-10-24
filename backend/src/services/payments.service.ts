@@ -1,6 +1,6 @@
 import type { PoolClient } from 'pg';
 import { pool } from '../db/pool.js';
-import { PG_LOCK_NOT_AVAILABLE, PG_UNIQUE_VIOLATION, isPgError, rollback } from '../db/transaction.js';
+import { PG_UNIQUE_VIOLATION, isLockContention, isPgError, rollback } from '../db/transaction.js';
 import { AppError } from '../errors/AppError.js';
 import type { PaymentWebhookPayload } from '../schemas/payments.schema.js';
 import { LOCK_TIMEOUT, type OrderStatus } from './orders.service.js';
@@ -159,7 +159,7 @@ export async function processPaymentEvent(
         return duplicateResult(stored, event, status.rows[0]?.status ?? 'pending');
       }
     }
-    if (isPgError(err) && err.code === PG_LOCK_NOT_AVAILABLE) {
+    if (isLockContention(err)) {
       throw new AppError(503, 'PAYMENT_BUSY', 'The order is busy. Please retry the webhook.');
     }
     throw err;

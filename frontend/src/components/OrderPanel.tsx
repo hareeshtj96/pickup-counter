@@ -1,6 +1,6 @@
 import { type FormEvent, useCallback, useMemo, useRef, useState } from 'react';
 import { toApiError } from '../api/client';
-import { type PaymentOutcome, collectOrder, simulatePayment } from '../api/pickup';
+import { type PaymentOutcome, claimPickup, simulatePayment } from '../api/pickup';
 import type { OrderState } from '../hooks/useOrder';
 import { describeApiError } from '../lib/errors';
 import { formatPaise, isUuid } from '../lib/format';
@@ -89,14 +89,10 @@ export function OrderPanel({ orderId, tracked, onTrack, onStockChanged }: Props)
 
   const collect = (id: string) =>
     runAction('collect', id, async () => {
-      const result = await collectOrder(id);
-      return {
-        orderId: id,
-        kind: 'success',
-        text: result.alreadyCollected
-          ? 'This order had already been collected. No stock was deducted again.'
-          : 'Collection confirmed by the server. Stock has been updated.',
-      };
+      // A claim that loses to another (409 ORDER_ALREADY_COLLECTED) is reported
+      // through the error path with its own message.
+      await claimPickup(id);
+      return { orderId: id, kind: 'success', text: 'Collection confirmed by the server. Stock has been updated.' };
     });
 
   return (

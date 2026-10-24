@@ -564,4 +564,36 @@ describe('concurrency (real overlapping transactions)', () => {
     }
     expect(await countOrders()).toEqual({ orders: 0, items: 0 });
   });
+
+  it('reports a deadlock as a retryable 503 without database details, leaving nothing behind', async () => {
+    const [low, high] = [await createProduct('Product A', 1000, 5), await createProduct('Product B', 1000, 5)].sort();
+    // Another session holds `high`; the order locks `low` (id order) and then waits for `high`.
+    const other = new pg.Client({ connectionString: testDatabaseUrl });
+    await other.connect();
+    await other.query('BEGIN');
+    await other.query('SELECT 1 FROM products WHERE id = $1 FOR UPDATE', [high]);
+    try {
+      const pending = request(baseUrl)
+        .post('/orders')
+        .send({ items: [{ productId: low, quantity: 1 }, { productId: high, quantity: 1 }] })
+        .then((res) => res);
+      await waitUntil(async () => (await blockedOrderTransactions()) === 1, 4_000);
+
+      // Close the cycle. The order transaction has waited longer, so its
+      // deadlock check (deadlock_timeout) runs first and PostgreSQL aborts it.
+      const otherWaits = other.query('SELECT 1 FROM products WHERE id = $1 FOR UPDATE', [low]);
+      const res = await pending;
+      await otherWaits; // granted once the aborted order transaction released `low`
+
+      expect(res.status).toBe(503);
+      expect(res.body).toEqual({
+        error: { code: 'RESERVATION_BUSY', message: 'The counter is busy. Please try again.' },
+      });
+      expect(res.text).not.toMatch(/deadlock|40P01/i);
+    } finally {
+      await other.query('ROLLBACK').catch(() => undefined);
+      await other.end();
+    }
+    expect(await countOrders()).toEqual({ orders: 0, items: 0 });
+  });
 });

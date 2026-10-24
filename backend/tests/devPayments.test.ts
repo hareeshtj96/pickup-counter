@@ -34,7 +34,7 @@ describe('POST /dev/orders/:id/simulate-payment (development only)', () => {
   it('pays a pending order through the normal payment service, using the stored total', async () => {
     const order = await pendingOrder();
 
-    const res = await request(enabledApp).post(`/api/dev/orders/${order.id}/simulate-payment`);
+    const res = await request(enabledApp).post(`/api/dev/orders/${order.id}/simulate-payment`).send({});
 
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ orderId: order.id, outcome: 'paid', orderStatus: 'paid', duplicate: false });
@@ -58,7 +58,7 @@ describe('POST /dev/orders/:id/simulate-payment (development only)', () => {
       [order.id],
     );
 
-    const res = await request(enabledApp).post(`/dev/orders/${order.id}/simulate-payment`);
+    const res = await request(enabledApp).post(`/dev/orders/${order.id}/simulate-payment`).send({});
 
     expect(res.body).toMatchObject({ outcome: 'late_payment', orderStatus: 'needs_review' });
     expect(await orderStatus(order.id)).toBe('needs_review');
@@ -66,9 +66,9 @@ describe('POST /dev/orders/:id/simulate-payment (development only)', () => {
 
   it('does not pay an already-paid order twice', async () => {
     const order = await pendingOrder();
-    await request(enabledApp).post(`/dev/orders/${order.id}/simulate-payment`);
+    await request(enabledApp).post(`/dev/orders/${order.id}/simulate-payment`).send({});
 
-    const again = await request(enabledApp).post(`/dev/orders/${order.id}/simulate-payment`);
+    const again = await request(enabledApp).post(`/dev/orders/${order.id}/simulate-payment`).send({});
 
     expect(again.body).toMatchObject({ outcome: 'already_paid', orderStatus: 'paid' });
   });
@@ -82,10 +82,10 @@ describe('POST /dev/orders/:id/simulate-payment (development only)', () => {
     expect(withBody.status).toBe(400);
     expect(await orderStatus(order.id)).toBe('pending');
 
-    const malformed = await request(enabledApp).post('/dev/orders/not-a-uuid/simulate-payment');
+    const malformed = await request(enabledApp).post('/dev/orders/not-a-uuid/simulate-payment').send({});
     expect(malformed.status).toBe(400);
 
-    const unknown = await request(enabledApp).post('/dev/orders/a1b2c3d4-9999-4000-8000-000000000999/simulate-payment');
+    const unknown = await request(enabledApp).post('/dev/orders/a1b2c3d4-9999-4000-8000-000000000999/simulate-payment').send({});
     expect(unknown.status).toBe(404);
     expect((unknown.body as ErrorResponse).error.code).toBe('ORDER_NOT_FOUND');
   });
@@ -94,7 +94,7 @@ describe('POST /dev/orders/:id/simulate-payment (development only)', () => {
     const order = await pendingOrder();
 
     for (const path of [`/dev/orders/${order.id}/simulate-payment`, `/api/dev/orders/${order.id}/simulate-payment`]) {
-      const res = await request(disabledApp).post(path);
+      const res = await request(disabledApp).post(path).send({});
       expect(res.status).toBe(404);
       expect((res.body as ErrorResponse).error.code).toBe('NOT_FOUND');
     }

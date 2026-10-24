@@ -27,6 +27,8 @@ export function describeApiError(error: ApiError, names: ReadonlyMap<string, str
       );
       return `Cannot hand over this order: ${lines.join('; ')}. Nothing was changed; please ask a supervisor.`;
     }
+    case 'ORDER_ALREADY_COLLECTED':
+      return 'This order had already been collected. No stock was deducted again.';
     case 'UNKNOWN_PRODUCT':
       return 'One of the selected products no longer exists. The catalog has been refreshed.';
     case 'VALIDATION_ERROR': {

@@ -259,6 +259,31 @@ describe('order status', () => {
     await waitFor(() => expect(statusBadge()).toHaveTextContent(ORDER_STATUS.expired.label));
     expect(screen.queryByRole('button', { name: /Simulate payment/ })).not.toBeInTheDocument();
   });
+
+  it('does not burst requests when the server still reports pending with 0 seconds left', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const api = setup();
+    api.on(`GET ${ORDER_PATH}`, { body: makeOrder({ expiresInSeconds: 1 }) });
+    openOrder();
+    render(<App />);
+    expect(await screen.findByText('0:01')).toBeInTheDocument();
+    expect(api.count(`GET ${ORDER_PATH}`)).toBe(1);
+
+    // The server's last instant before it reports the order as expired.
+    api.on(`GET ${ORDER_PATH}`, { body: makeOrder({ status: 'pending', expiresInSeconds: 0 }) });
+    await act(() => vi.advanceTimersByTimeAsync(1_100));
+    await waitFor(() => expect(api.count(`GET ${ORDER_PATH}`)).toBe(2)); // one re-check at zero
+    expect(screen.getByText(/checking with the server/)).toBeInTheDocument();
+
+    await act(() => vi.advanceTimersByTimeAsync(2_500));
+    expect(api.count(`GET ${ORDER_PATH}`)).toBe(2); // no immediate repeat
+
+    // The regular 5 s poll fetches the authoritative status.
+    api.on(`GET ${ORDER_PATH}`, { body: makeOrder({ status: 'expired', expiresInSeconds: 0 }) });
+    await act(() => vi.advanceTimersByTimeAsync(1_600));
+    await waitFor(() => expect(statusBadge()).toHaveTextContent(ORDER_STATUS.expired.label));
+    expect(api.count(`GET ${ORDER_PATH}`)).toBe(3);
+  });
 });
 
 describe('payment simulation', () => {
@@ -277,7 +302,8 @@ describe('payment simulation', () => {
     api.on(`GET ${ORDER_PATH}`, () => refetch.promise);
     await user.click(payButton);
 
-    expect(api.calls.find((c) => c.path.endsWith('/simulate-payment'))?.body).toBeUndefined(); // no amount sent
+    // JSON Content-Type with an empty body: no amount or status from the browser.
+    expect(api.calls.find((c) => c.path.endsWith('/simulate-payment'))?.body).toEqual({});
     expect(await screen.findByRole('status')).toHaveTextContent('Payment confirmed by the server.');
     // The badge follows GET /orders/:id, which has not answered yet.
     expect(statusBadge()).toHaveTextContent('Awaiting payment');
@@ -344,7 +370,7 @@ describe('pickup collection', () => {
   it('confirms collection only after the server does, then refreshes order and stock', async () => {
     const api = paidOrderApi();
     const collected = deferred<MockReply>();
-    api.on(`POST ${ORDER_PATH}/collect`, () => collected.promise);
+    api.on(`POST ${ORDER_PATH}/pickup-claim`, () => collected.promise);
     const user = userEvent.setup();
     render(<App />);
 
@@ -352,7 +378,7 @@ describe('pickup collection', () => {
     const busy = screen.getByRole('button', { name: 'Confirming pickup…' });
     expect(busy).toBeDisabled();
     await user.click(busy);
-    expect(api.count(`POST ${ORDER_PATH}/collect`)).toBe(1);
+    expect(api.count(`POST ${ORDER_PATH}/pickup-claim`)).toBe(1);
     expect(screen.queryByText(/Collection confirmed/)).not.toBeInTheDocument();
 
     api.on(`GET ${ORDER_PATH}`, { body: makeOrder({ status: 'collected', expiresInSeconds: null }) });
@@ -363,22 +389,34 @@ describe('pickup collection', () => {
     await waitFor(() => expect(api.count('GET /api/products')).toBeGreaterThanOrEqual(2));
   });
 
-  it('tells staff when the order had already been collected', async () => {
+  it('tells staff when a competing claim already collected the order (409)', async () => {
     const api = paidOrderApi();
-    api.on(`POST ${ORDER_PATH}/collect`, {
-      body: { ...makeOrder({ status: 'collected', expiresInSeconds: null }), alreadyCollected: true },
+    api.on(`POST ${ORDER_PATH}/pickup-claim`, () => {
+      api.on(`GET ${ORDER_PATH}`, { body: makeOrder({ status: 'collected', expiresInSeconds: null }) });
+      return {
+        status: 409,
+        body: {
+          error: {
+            code: 'ORDER_ALREADY_COLLECTED',
+            message: 'This order has already been collected.',
+            details: { status: 'collected' },
+          },
+        },
+      };
     });
     const user = userEvent.setup();
     render(<App />);
     await user.click(await screen.findByRole('button', { name: 'Staff: confirm pickup' }));
-    expect(await screen.findByRole('status')).toHaveTextContent(
+    expect(await screen.findByRole('alert')).toHaveTextContent(
       'This order had already been collected. No stock was deducted again.',
     );
+    expect(screen.queryByText(/Collection confirmed/)).not.toBeInTheDocument();
+    await waitFor(() => expect(statusBadge()).toHaveTextContent(ORDER_STATUS.collected.label));
   });
 
   it('shows the server reason when the order is not collectable (e.g. expired)', async () => {
     const api = paidOrderApi();
-    api.on(`POST ${ORDER_PATH}/collect`, {
+    api.on(`POST ${ORDER_PATH}/pickup-claim`, {
       status: 409,
       body: {
         error: {
@@ -396,7 +434,7 @@ describe('pickup collection', () => {
 
   it('explains insufficient physical stock with product names', async () => {
     const api = paidOrderApi();
-    api.on(`POST ${ORDER_PATH}/collect`, {
+    api.on(`POST ${ORDER_PATH}/pickup-claim`, {
       status: 409,
       body: {
         error: {
@@ -415,7 +453,7 @@ describe('pickup collection', () => {
 
   it('asks to retry when the counter is busy', async () => {
     const api = paidOrderApi();
-    api.on(`POST ${ORDER_PATH}/collect`, {
+    api.on(`POST ${ORDER_PATH}/pickup-claim`, {
       status: 503,
       body: { error: { code: 'COLLECTION_BUSY', message: 'The order is busy. Please try again.' } },
     });

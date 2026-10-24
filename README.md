@@ -22,7 +22,9 @@ A full-stack TypeScript application for ordering items for counter pickup.
 
 ## Quick start
 
-Prerequisite: Docker Desktop is running.
+**Prerequisites**
+- **Docker Desktop**, running. This is all you need for the standard flow below: the backend tests and the webhook sender run inside the backend container.
+- **Node.js ≥ 22** and npm, *only* for commands run directly on your machine, such as the frontend tests (`cd frontend && npm test`), typecheck/lint/build, or the webhook sender run from the host. Install the dependencies first with `npm ci` in `backend/` and/or `frontend/`.
 
 ```bash
 docker compose up --build
@@ -33,6 +35,8 @@ docker compose up --build
 | Frontend | http://localhost:5173                |
 | API      | http://localhost:4000/health         |
 | Postgres | `localhost:5433` (user `pickup`, db `pickup_counter`) |
+
+All three ports are published on **127.0.0.1 only**: they are reachable from this machine but not from the rest of the network. Containers still reach each other by service name (`db:5432`, `backend:4000`).
 
 No `.env` is required. Compose falls back to **local-only** defaults. To change ports or credentials:
 
@@ -52,7 +56,8 @@ curl -i -X POST http://localhost:4000/orders -H 'Content-Type: application/json'
   -d '{"items":[{"productId":"a1b2c3d4-0001-4000-8000-000000000001","quantity":2}]}'   # 201, reserves 2 Samosas
 curl -i http://localhost:4000/orders/<id>      # 200, status + expiresInSeconds
 docker compose exec backend npm run webhook:send -- --order <id> --amount <totalPaise>   # signed payment -> paid
-curl -i -X POST http://localhost:4000/orders/<id>/collect   # 200, collected; physical stock deducted once
+curl -i -X POST http://localhost:4000/orders/<id>/pickup-claim \
+  -H 'Content-Type: application/json' -d '{}'   # 200, collected; physical stock deducted once (a second claim -> 409)
 docker compose exec backend npm test           # integration tests on pickup_counter_test
 ```
 
@@ -74,11 +79,11 @@ React + Vite + TypeScript, with no UI library. The browser only calls `/api/...`
    - The countdown starts from the server's `expiresInSeconds`, so the device clock doesn't matter.
    - The order ID lives in the URL (`#/orders/<id>`), so a reload or a shared link reopens it. Nothing is stored in the browser.
    - You can also open any order by ID.
-4. **Status polling:** only while the order is `pending`, every 5 s, never two requests at once. Polling stops on `paid`, `expired`, `needs_review` or `collected`, and when the view closes. When the countdown reaches zero, the order is re-checked with the server at once.
+4. **Status polling:** only while the order is `pending`, every 5 s, never two requests at once. Polling stops on `paid`, `expired`, `needs_review` or `collected`, and when the view closes. When the local countdown runs down to zero, the order is re-checked with the server once. If the server still reports `pending` with 0 seconds left (its last instant before expiry), the page waits for the next 5 s poll instead of re-fetching repeatedly.
 5. **Simulate payment** (pending orders only, development only): see below. The status changes to "Paid" only after `GET /orders/:id` confirms it.
-6. **Staff: confirm pickup** (paid orders only; `POST /orders/:id/collect`):
+6. **Staff: confirm pickup** (paid orders only; `POST /orders/:id/pickup-claim`):
    - A success message appears only after the server confirms.
-   - `alreadyCollected: true` reads "already collected; no stock deducted again".
+   - A claim that loses to another (`409 ORDER_ALREADY_COLLECTED`) reads "already collected; no stock deducted again".
    - `ORDER_NOT_COLLECTABLE`, `INSUFFICIENT_PHYSICAL_STOCK` and `COLLECTION_BUSY` show the server's reason.
    - The UI states plainly that there is **no staff login or PIN**.
 7. After creating, paying, collecting, or any change of status (including expiry), the catalog is re-fetched. The browser never decrements stock itself.
@@ -92,7 +97,8 @@ The real payment path is the HMAC-signed webhook. The browser cannot sign it, be
 - **It runs the normal payment service** (`processPaymentEvent`), exactly like a signed webhook. That means the order lock, the deadline check made under the lock, `UNIQUE (event_id)` and the `needs_review` rules all still apply.
   - A late simulated payment becomes `needs_review`.
   - A second one is `already_paid`.
-- **The server decides everything:** the amount is the order's stored `total_paise` and the event ID is generated server-side (`devsim_<uuid>`). The request takes no body, and any fields sent are rejected with 400.
+- **The server decides everything:** the amount is the order's stored `total_paise` and the event ID is generated server-side (`devsim_<uuid>`). The request must be sent as `Content-Type: application/json` (otherwise **415** `UNSUPPORTED_MEDIA_TYPE`), with an empty body or `{}`. Any fields sent are rejected with 400.
+- **Only reachable from this machine:** Compose publishes the API on 127.0.0.1 only.
 - **It only exists when `DEV_PAYMENT_SIMULATOR=true`.** That flag defaults to `false`, and the API refuses to start with it set to `true` when `NODE_ENV=production`. Docker Compose sets it to `true` for local development only. When it is off, the route returns 404 and the UI points you to the signed webhook sender instead.
 - **It moves no real money** and does not test signature verification; the webhook tests cover that.
 
@@ -219,7 +225,7 @@ Request rules (400 `VALIDATION_ERROR` otherwise):
 | 409 | `INSUFFICIENT_STOCK` | Any item lacks stock. `details` lists `{ productId, requested, available }`. Nothing is reserved. |
 | 422 | `UNKNOWN_PRODUCT` | A product does not exist. `details.productIds` lists them. |
 | 422 | `ORDER_TOTAL_TOO_LARGE` | The total would not fit in an `INTEGER` of paise |
-| 503 | `RESERVATION_BUSY` | The product rows stayed locked for more than 5 s. Safe to retry. |
+| 503 | `RESERVATION_BUSY` | The product rows stayed locked for more than 5 s, or PostgreSQL aborted the transaction to break a deadlock. It was rolled back in full, so it is safe to retry; database details are never returned. |
 
 ### `GET /orders/:id`
 
@@ -229,9 +235,36 @@ Returns the same shape as above, with the order's **current** status:
 - `expiresInSeconds` is `null` for `paid`, `needs_review` and `collected` orders, because the deadline no longer applies to them.
 - 404 `ORDER_NOT_FOUND` for an unknown id; 400 for a malformed id.
 
-### `POST /orders/:id/collect`
+### `POST /orders/:id/pickup-claim`
 
-Staff confirm that the customer has physically collected a **paid** order. It is also served at `/api/orders/:id/collect`. No body is needed; any body fields are rejected with 400. There is no PIN or staff authentication, because the requirements define none.
+Staff confirm that the customer has physically collected a **paid** order. This is the pickup route named in the brief, and the one the frontend uses. It is also served at `/api/orders/:id/pickup-claim`. **Exactly one claim can succeed:**
+
+| Case | Response |
+| --- | --- |
+| First claim of a `paid` order | **200**, the order with `status: "collected"`. Physical stock is deducted in the same transaction. |
+| Competing claim (simultaneous) or any later claim | **409** `ORDER_ALREADY_COLLECTED`, with `details: { status: "collected" }`. No stock change. |
+| `pending`, `expired`, `needs_review` | **409** `ORDER_NOT_COLLECTABLE` |
+| Shelf shortage, unknown id, bad id/body, missing JSON `Content-Type`, rows locked | Same as `/collect` below: 409 `INSUFFICIENT_PHYSICAL_STOCK`, 404, 400, 415, 503 `COLLECTION_BUSY` |
+
+```bash
+curl -X POST http://localhost:4000/orders/<id>/pickup-claim -H 'Content-Type: application/json' -d '{}'
+```
+
+When two claims arrive at once, both queue on the order's row lock. The first one deducts the stock and sets the order to `collected`. The second then reads `collected` under the lock and gets 409 (test: "two simultaneous pickup claims: exactly one succeeds, the other gets 409").
+
+### `POST /orders/:id/collect` (idempotent variant)
+
+The same exactly-once collection, kept from Phase 5 for callers that prefer idempotent retries: a repeat returns **200** with `"alreadyCollected": true` instead of 409. It is also served at `/api/orders/:id/collect`. The request must declare `Content-Type: application/json`; the body can be empty or `{}`, and any body fields are rejected with 400. There is no PIN or staff authentication, because the requirements define none.
+
+```bash
+curl -X POST http://localhost:4000/orders/<id>/collect -H 'Content-Type: application/json' -d '{}'
+```
+
+**Why JSON is required although there is no body:**
+- A POST without a JSON content type is a CORS "simple request", which another website open in the same browser could fire blindly.
+- Requiring `application/json` forces a CORS preflight instead, and this API grants none to other origins.
+- `pickup-claim` and the dev payment simulator have the same rule.
+- `POST /orders` already requires a JSON body, and the signed webhook keeps its own raw-body contract.
 
 | Order state | Response |
 | --- | --- |
@@ -240,8 +273,9 @@ Staff confirm that the customer has physically collected a **paid** order. It is
 | `pending`, `expired` (stored, or unpaid past `expiresAt`), `needs_review` | **409** `ORDER_NOT_COLLECTABLE`, with `details: { status }` |
 | `paid`, but the shelf holds less than an item's quantity | **409** `INSUFFICIENT_PHYSICAL_STOCK`, with `details: [{ productId, required, inStock }]`. Nothing changes. |
 | unknown id | **404** `ORDER_NOT_FOUND` |
+| missing or non-JSON `Content-Type` | **415** `UNSUPPORTED_MEDIA_TYPE`. Nothing changes. |
 | malformed id or body field | **400** `VALIDATION_ERROR` |
-| rows locked > 5 s | **503** `COLLECTION_BUSY`. Safe to retry. |
+| rows locked > 5 s, or a database deadlock | **503** `COLLECTION_BUSY`. The transaction was rolled back in full, so it is safe to retry. |
 
 **How stock is deducted exactly once.** Everything runs in one transaction (`collectOrder` in `orders.service.ts`):
 
@@ -345,7 +379,7 @@ Idempotency is enforced by PostgreSQL, not by memory:
 - **Different orders:** if the same `eventId` arrives for two different orders at the same moment, `UNIQUE (event_id)` rejects the second insert. The service rolls back, reads the stored event and returns `409`.
 - **State guard:** the status update also re-checks the expected current status, so a missing lock could never pay an order twice. A test that removed the order lock got `500`s, not double payments.
 
-Every processed or duplicate event returns **200** (`{ eventId, orderId, outcome, orderStatus, duplicate }`), so the provider stops retrying. `PAYMENT_BUSY` (503) is returned if the order stays locked for more than 5 s.
+Every processed or duplicate event returns **200** (`{ eventId, orderId, outcome, orderStatus, duplicate }`), so the provider stops retrying. `PAYMENT_BUSY` (503) is returned if the order stays locked for more than 5 s, or if PostgreSQL aborts the transaction to break a deadlock. Nothing is recorded in either case, so the provider's retry is safe.
 
 ### Outcomes
 
@@ -406,11 +440,11 @@ The rules are enforced by PostgreSQL itself, so invalid data is rejected no matt
 
 | Status | Holds stock? | Set by |
 | ------ | ------------ | ------ |
-| `pending` | Yes, while `expires_at > now()` | Order creation (this phase) |
-| `paid` | Yes, until collected | Payment (Phase 4) |
-| `expired` | No | Expiry (this phase) |
-| `needs_review` | No. For example, payment arrived after expiry; a person decides. | Payment (Phase 4) |
-| `collected` | No. Physical stock was decremented at pickup. | `POST /orders/:id/collect` (Phase 5), only from `paid` |
+| `pending` | Yes, while `expires_at > now()` | `POST /orders` |
+| `paid` | Yes, until collected | A captured payment received in time with the exact amount (signed webhook or dev simulator) |
+| `expired` | No | An unpaid order past `expires_at`, stored by the expiry sweep or by `GET /orders/:id` |
+| `needs_review` | No. For example, payment arrived after expiry; a person decides. | A late or mismatched payment (signed webhook or dev simulator) |
+| `collected` | No. Physical stock was decremented at pickup. | `POST /orders/:id/collect`, only from `paid` |
 
 **Physical stock vs. reservations.** `products.stock_quantity` changes only at collection (`POST /orders/:id/collect`). Creating or paying for an order does not touch it.
 - Collection moves units from "reserved by a paid order" to "gone from the shelf" in one transaction, so availability does not change and nothing is subtracted twice.
@@ -591,9 +625,63 @@ The local default is `pickup_dev_password` everywhere: Compose defaults, `.env.e
 
 ### Port 5433 conflicts on the host
 
-Inside Docker the backend always uses `db:5432`, so this only affects tools running on your machine. If another PostgreSQL on your machine also listens on 5433, `localhost:5433` may reach that server instead of the Compose database. You will typically see `28P01`. The marker check above still refuses to reset an unmarked database there. To use a free port, set `POSTGRES_HOST_PORT` (for example `5434`) in `.env`, run `docker compose up -d db`, and use the same port in `TEST_DATABASE_URL` and `DATABASE_URL`.
+Inside Docker the backend always uses `db:5432`; the host port only matters for publishing. Ports are published on `127.0.0.1`, so if another program on your machine already listens on 5433, `docker compose up` **fails to start** the database with an error like:
+
+```
+ports are not available: exposing port TCP 127.0.0.1:5433 … bind: An attempt was made to access a socket in a way forbidden by its access permissions
+```
+
+To use a free port, set `POSTGRES_HOST_PORT` (for example `5434`) in `.env`, or on the command line (`POSTGRES_HOST_PORT=5434 docker compose up -d`). Use the same port in host-side `DATABASE_URL` / `TEST_DATABASE_URL`, and export `POSTGRES_HOST_PORT` for host-side tests so the test-database guard accepts it. The marker check still refuses to reset an unmarked database if a URL ever points at another server.
 
 ---
+
+## How concurrency was tested
+
+Every concurrency test runs against the **real PostgreSQL** test database (`pickup_counter_test`), with no mocks. To make sure the requests genuinely overlap:
+1. A separate connection first holds the relevant row lock.
+2. The test fires the requests, then waits until `pg_stat_activity` shows **all of them blocked inside PostgreSQL at the same moment**.
+3. Only then does it release the lock.
+
+The assertions check the final database state, not just HTTP codes.
+
+**The three concurrency tests required by the brief:**
+
+| Brief scenario | Test (exact name) | What it proves |
+| --- | --- | --- |
+| Ten simultaneous customers compete for the last two units | `backend/tests/orders.test.ts`: "ten customers racing for the last two units: exactly two succeed" | 10 overlapping `POST /orders` for 2 units give exactly 2 × 201 and 8 × 409 `INSUFFICIENT_STOCK`; the database shows stock 2, reserved 2, available 0, exactly 2 orders, and no order without items |
+| The same webhook event is delivered twice | `backend/tests/payments.test.ts`: "the same webhook event delivered twice simultaneously is applied exactly once" | Two overlapping deliveries of one signed event both get 200: one applies it (`duplicate: false`), the other is acknowledged (`duplicate: true`). One `payment_events` row; the order is paid once; stock is untouched. |
+| Two pickup claims arrive simultaneously | `backend/tests/collection.test.ts`: "two simultaneous pickup claims: exactly one succeeds, the other gets 409" | One claim gets 200 (collected) and the other 409 `ORDER_ALREADY_COLLECTED`; stock is deducted exactly once (10 → 7 for 3 units) |
+
+**Related tests:**
+- 5 simultaneous copies of one event, two distinct events racing for one order, and the same `eventId` racing for two orders (hits the `UNIQUE` constraint)
+- concurrent `/collect`, two orders collecting the same product without losing an update, and opposite lock orders without deadlock
+- a payment waiting for an in-flight order creation, and a real deadlock reported as a retryable 503
+
+**Proof the tests catch real bugs (mutation checks).** During development, the safeguards were removed one at a time:
+- moving the availability check before the row lock gave 10 × 201 for 2 units
+- removing the order lock and the status guard in collection deducted stock twice
+- removing the pickup-claim 409 branch gave `[200, 200]`
+
+Each time the relevant test failed. The code was then restored.
+
+## Assumptions
+
+- **Single counter, local demo.** There are no user accounts, staff login or pickup PIN, because the brief defines none (see [Security notes](#security-notes)). Order IDs are random UUIDs.
+- **Prices are fixed per order.** Each order stores a price snapshot, so later catalog changes do not alter it.
+- **Reservations last 120 s from database time.** The browser's clock is never used.
+- **Payments come from a provider via a signed webhook.** The browser "Simulate payment" button is development-only and runs the same server-side rules.
+- **Late or wrong-amount payments are not refunded automatically.** They become `needs_review` for a person to resolve; see [Outcomes](#outcomes) for the exact policy.
+- **Physical stock leaves the shelf at pickup**, not at payment.
+- **Retries are left to the client.** A 503 `*_BUSY` response is safe to retry; the server never retries automatically.
+
+## What I would improve next
+
+- **Staff authentication** (or a pickup code shown to the customer) for `pickup-claim`, and an admin view for `needs_review` orders, including a refund workflow.
+- **A timestamp in the webhook signature**, with a replay window, as most payment providers use.
+- **Production frontend serving:** serve the built `frontend/dist` (for example from nginx) instead of the Vite dev server in Compose.
+- **Live catalog updates** (polling or server-sent events), so other customers' reservations show without pressing Refresh.
+- **Observability:** structured logs and metrics for reservations, expiries, payment outcomes and lock contention.
+- **A deterministic test for the exact 120 s payment-vs-new-order boundary.** Today it is covered by the lock-ordering design plus a lock-wait test.
 
 ## Decisions log
 
@@ -635,6 +723,7 @@ Inside Docker the backend always uses `db:5432`, so this only affects tools runn
 | 34 | Order ID kept in the URL hash, not localStorage | Survives reloads and can be shared; stores no data in the browser. |
 | 35 | Countdown anchored to the server's `expiresInSeconds` at response time; zero triggers a server re-check | Device clocks are never trusted; the server decides expiry. |
 | 36 | No UI library or state manager; plain React state and hooks | The app has two panels and five endpoints; extra dependencies would add weight without benefit. |
+| 37 | `POST /orders/:id/pickup-claim` (brief) returns 409 to the competing claim; `/collect` kept as the idempotent 200 variant | Matches the brief exactly without breaking the earlier route; both share one exactly-once service. |
 
 ## Security notes
 

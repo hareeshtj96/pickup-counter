@@ -17,7 +17,9 @@ services:
     ports:
       # Host port 5433 by default so it does not clash with a locally installed
       # PostgreSQL on 5432. Containers still use db:5432 internally.
-      - "${POSTGRES_HOST_PORT:-5433}:5432"
+      # All published ports bind to 127.0.0.1 only: reachable from this machine,
+      # not from the rest of the network.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
     volumes:
       # Named volume: data survives `docker compose down` (use `down -v` to wipe it).
       - pgdata:/var/lib/postgresql/data
@@ -45,13 +47,14 @@ services:
       TEST_DATABASE_URL: postgres://${POSTGRES_USER:-pickup}:${POSTGRES_PASSWORD:-pickup_dev_password}@db:5432/pickup_counter_test
       # Development-only placeholder; set a real secret via .env outside local dev.
       PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:-dev-only-insecure-webhook-secret-change-me}
-      # Local demo only: enables POST /dev/orders/:id/simulate-payment (refused in production).
+      # Local demo only: enables POST /dev/orders/:id/simulate-payment (refused in
+      # production). Reachable only from this machine (ports bind to 127.0.0.1).
       DEV_PAYMENT_SIMULATOR: ${DEV_PAYMENT_SIMULATOR:-true}
       CHOKIDAR_USEPOLLING: "true"
       # Lets the config-consistency test read the files mounted below.
       PROJECT_ROOT: /project
     ports:
-      - "${BACKEND_HOST_PORT:-4000}:4000"
+      - "127.0.0.1:${BACKEND_HOST_PORT:-4000}:4000"
     volumes:
       - ./backend/src:/app/src
       - ./backend/tests:/app/tests
@@ -82,7 +85,7 @@ services:
       API_PROXY_TARGET: http://backend:4000
       CHOKIDAR_USEPOLLING: "true"
     ports:
-      - "${FRONTEND_HOST_PORT:-5173}:5173"
+      - "127.0.0.1:${FRONTEND_HOST_PORT:-5173}:5173"
     volumes:
       - ./frontend/src:/app/src
       - ./frontend/index.html:/app/index.html

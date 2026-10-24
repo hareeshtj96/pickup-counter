@@ -483,6 +483,26 @@ describe('concurrency (real overlapping transactions)', () => {
     }
   }
 
+  // Required by the brief: the same webhook event is delivered twice.
+  it('the same webhook event delivered twice simultaneously is applied exactly once', async () => {
+    const { productId, orderId, total } = await pendingOrder();
+    const event = payload(orderId, total);
+    const release = await holdLock('SELECT 1 FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+
+    const pending = [1, 2].map(() => sendEvent(event, baseUrl).then((res) => res));
+    await waitForBlocked('payment:lock-order', 2); // both deliveries are inside PostgreSQL at once
+    await release();
+    const results = await Promise.all(pending);
+
+    expect(results.map((r) => r.status)).toEqual([200, 200]);
+    const bodies = results.map((r) => r.body as WebhookResult);
+    expect(bodies.map((b) => b.duplicate).sort()).toEqual([false, true]);
+    expect(bodies.every((b) => b.outcome === 'paid' && b.orderStatus === 'paid')).toBe(true);
+    expect(await events(orderId)).toHaveLength(1);
+    expect((await orderRow(orderId)).status).toBe('paid');
+    expect(await stock(productId)).toEqual({ stock_quantity: 10, reserved_units: 2, available_units: 8 });
+  });
+
   it('five simultaneous copies of one event apply it exactly once', async () => {
     const { orderId, total } = await pendingOrder();
     const event = payload(orderId, total);
