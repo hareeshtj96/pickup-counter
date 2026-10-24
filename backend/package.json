@@ -12,6 +12,7 @@
     "start": "node dist/server.js",
     "migrate": "tsx src/db/cli/migrate.ts",
     "seed": "tsx src/db/cli/seed.ts",
+    "webhook:send": "tsx scripts/send-webhook.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint .",
     "test": "vitest run"

@@ -31,6 +31,7 @@ describe('migration runner (real PostgreSQL)', () => {
       '0001_baseline.sql',
       '0002_create_products.sql',
       '0003_create_orders.sql',
+      '0004_create_payment_events.sql',
     ]);
   });
 

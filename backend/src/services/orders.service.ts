@@ -1,5 +1,5 @@
-import type { PoolClient } from 'pg';
 import { pool } from '../db/pool.js';
+import { PG_LOCK_NOT_AVAILABLE, isPgError, rollback } from '../db/transaction.js';
 import { AppError } from '../errors/AppError.js';
 
 /** How long a new, unpaid order holds its stock. */
@@ -10,8 +10,7 @@ export const MAX_QUANTITY_PER_ITEM = 20;
 /** orders.total_paise is a PostgreSQL INTEGER. */
 const MAX_TOTAL_PAISE = 2_147_483_647;
 /** Give up instead of queueing forever if product rows stay locked. */
-const LOCK_TIMEOUT = '5s';
-const LOCK_NOT_AVAILABLE = '55P03';
+export const LOCK_TIMEOUT = '5s';
 
 export type OrderStatus = 'pending' | 'paid' | 'expired' | 'needs_review' | 'collected';
 
@@ -134,7 +133,7 @@ export async function createOrder(items: OrderItemInput[]): Promise<Order> {
     await client.query('COMMIT');
   } catch (err) {
     clientBroken = !(await rollback(client));
-    if (isPgError(err) && err.code === LOCK_NOT_AVAILABLE) {
+    if (isPgError(err) && err.code === PG_LOCK_NOT_AVAILABLE) {
       throw new AppError(503, 'RESERVATION_BUSY', 'The counter is busy. Please try again.');
     }
     throw err;
@@ -238,17 +237,3 @@ type OrderItemRow = {
   quantity: number;
   unit_price_paise: number;
 };
-
-/** Returns false if the connection could not be rolled back (and must be discarded). */
-async function rollback(client: PoolClient): Promise<boolean> {
-  try {
-    await client.query('ROLLBACK');
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function isPgError(err: unknown): err is { code: string } {
-  return typeof err === 'object' && err !== null && 'code' in err && typeof err.code === 'string';
-}

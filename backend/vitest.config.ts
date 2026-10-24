@@ -17,6 +17,9 @@ export default defineConfig({
       // The concurrency test holds 10 simultaneous order transactions open;
       // leave headroom for the test's own queries.
       DB_POOL_MAX: '20',
+      // Fixed, test-only key so webhook tests are deterministic and never use
+      // a real or development secret.
+      PAYMENT_WEBHOOK_SECRET: 'test-only-webhook-secret-for-integration-tests',
     },
     globalSetup: ['tests/globalSetup.ts'],
     setupFiles: ['tests/setup.ts'],

@@ -10,7 +10,7 @@ A full-stack TypeScript application for ordering items for counter pickup.
 | Tests    | Vitest + Supertest against a real PostgreSQL DB |
 | Runtime  | Docker + Docker Compose                        |
 
-**Status:** Phase 1 (foundation), Phase 2 (product catalog) and Phase 3 (orders with 120-second stock reservations) are complete. Payments and pickup are not built yet.
+**Status:** Phase 1 (foundation), Phase 2 (product catalog), Phase 3 (orders with 120-second stock reservations) and Phase 4 (signed, idempotent payment webhook) are complete. Pickup is not built yet.
 
 ---
 
@@ -45,6 +45,7 @@ curl -i http://localhost:4000/products         # 200 {"products":[...5 seeded sn
 curl -i -X POST http://localhost:4000/orders -H 'Content-Type: application/json' \
   -d '{"items":[{"productId":"a1b2c3d4-0001-4000-8000-000000000001","quantity":2}]}'   # 201, reserves 2 Samosas
 curl -i http://localhost:4000/orders/<id>      # 200, status + expiresInSeconds
+docker compose exec backend npm run webhook:send -- --order <id> --amount <totalPaise>   # signed payment -> paid
 docker compose exec backend npm test           # integration tests on pickup_counter_test
 ```
 
@@ -100,6 +101,9 @@ backend/
     services/              Business logic and SQL
     schemas/               Zod request schemas
     jobs/expirySweeper.ts  In-process timer that persists 'expired' for overdue orders
+    payments/signature.ts  Webhook HMAC signing and verification
+    db/transaction.ts      Shared rollback / PostgreSQL error-code helpers
+  scripts/send-webhook.ts  Signed webhook sender for local testing (`npm run webhook:send`)
     middleware/            validate (Zod), notFound, errorHandler
     errors/AppError.ts     Errors that are safe to show to clients
   tests/                   Vitest + Supertest integration tests
@@ -178,6 +182,108 @@ Returns the same shape as above, with the order's **current** status:
 - `expiresInSeconds` is `null` for `paid`, `needs_review` and `collected` orders, because the deadline no longer applies to them.
 - 404 `ORDER_NOT_FOUND` for an unknown id; 400 for a malformed id.
 
+## Payment webhook
+
+### `POST /payments/webhook`
+
+This simulates a payment provider reporting a payment. It is also served at `/api/payments/webhook`.
+
+```http
+POST /payments/webhook
+Content-Type: application/json
+X-Pickup-Signature: sha256=3f1c…(64 lowercase hex chars)
+
+{"eventId":"evt_123","orderId":"e15fb5e3-…","amountPaise":4000,"status":"captured"}
+```
+
+| Field | Rules |
+| ----- | ----- |
+| `eventId` | The provider's unique event id. 1–200 characters: letters, digits and `_ . : -` |
+| `orderId` | UUID of an existing order |
+| `amountPaise` | Positive integer paise (`INTEGER` range) |
+| `status` | `captured` or `failed`. Anything else gets 400. |
+
+Unknown fields are rejected. The amount is **only compared** with the order's stored `total_paise`; it is never used as the order total.
+
+### Signature verification
+
+- **Header:** `X-Pickup-Signature: sha256=<hex>`, where `hex = HMAC-SHA256(PAYMENT_WEBHOOK_SECRET, raw request body bytes)`.
+- **Exact bytes:** for this path only, `app.ts` installs `express.raw()` **before** `express.json()`. The signature is computed over the exact bytes received, never over re-serialised JSON. A test sends a body with unusual spacing to prove it.
+- **Order of checks:** signature first, then JSON parsing, then validation. Nothing about the payment is read before the signature passes.
+- **Format first:** the header must match `sha256=` followed by exactly 64 lowercase hex characters, and the decoded length is checked, before `crypto.timingSafeEqual` compares the bytes.
+- **Rejections (401):** `SIGNATURE_MISSING`, `SIGNATURE_MALFORMED` or `SIGNATURE_INVALID`. A rejected request creates no event and changes no order.
+- **Replays:** there is no timestamp in the signature. Replaying a captured request is harmless, because the same `eventId` is never applied twice.
+
+### Configuring the secret
+
+`PAYMENT_WEBHOOK_SECRET` is **required**, must be at least 32 characters, and is validated in `src/config/env.ts`.
+
+- **Local Docker:** Compose falls back to the placeholder `dev-only-insecure-webhook-secret-change-me`, the same value as in `.env.example`. To override it, set it in `.env`.
+- **Production:** the API refuses to start with any `dev-only-…` value when `NODE_ENV=production`. Use a long random value, for example `openssl rand -hex 32`.
+- **Tests:** they use their own fixed key (`vitest.config.ts`).
+- **No leaks:** the secret is never logged or returned in responses.
+
+### Sending a signed test webhook
+
+```bash
+# 1. Create an order and note its id and totalPaise
+curl -s -X POST http://localhost:4000/orders -H 'Content-Type: application/json' \
+  -d '{"items":[{"productId":"a1b2c3d4-0002-4000-8000-000000000002","quantity":2}]}'
+
+# 2. Pay it (inside Docker the secret is already set)
+docker compose exec backend npm run webhook:send -- --order <orderId> --amount <totalPaise>
+
+# Send the same event twice to see idempotency (second reply has "duplicate":true)
+docker compose exec backend npm run webhook:send -- --order <orderId> --amount <totalPaise> --repeat 2
+
+# Or reuse a specific event id, choose a status, or target another URL
+docker compose exec backend npm run webhook:send -- --order <orderId> --amount 999 \
+  --event-id evt_manual_1 --status captured --url http://localhost:4000/payments/webhook
+
+# From your machine instead of the container (Git Bash / Linux / macOS)
+cd backend && PAYMENT_WEBHOOK_SECRET=dev-only-insecure-webhook-secret-change-me npm run webhook:send -- --order <orderId> --amount <totalPaise>
+```
+
+The sender:
+- generates `evt_<uuid>` unless `--event-id` is given
+- signs exactly the bytes it sends
+- prints each HTTP status and response body, never the secret
+- exits with code 1 on any non-2xx response
+
+### Processing and idempotency
+
+All steps run in **one transaction**. Any failure rolls back both the event row and the order change. A test forces a database error mid-way, sees `500` with no event stored, and then confirms the retry succeeds.
+
+1. **Lock the order row** (`FOR UPDATE`). An unknown order returns 404, and nothing is stored, because events must reference an existing order.
+2. **Look up the `eventId`.**
+   - If it was already processed, return 200 with `"duplicate": true` and the original outcome. Nothing is re-applied. The event is not even re-evaluated, so a duplicate of a paid event still reports `paid` after the deadline.
+   - If the `eventId` was used with a different order, amount or status: `409 EVENT_ID_CONFLICT`.
+3. **If the order could become paid, lock its product rows** in id order, the same locks order creation takes. The deadline decision is then serialised with any order competing for those units. Without this, a payment judged "in time" at 119.99 s could commit just after a new order had taken the units at 120.00 s.
+4. **Decide using `clock_timestamp()`**, which is taken *after* the locks are held. The order lock alone is not enough, because the expiry check must also be serialised with competing order creation.
+5. **Insert the event, update the order, `COMMIT`.**
+
+Idempotency is enforced by PostgreSQL, not by memory:
+- **Same order:** simultaneous copies of an event queue on the order lock. The first one applies the event, and the rest find it in step 2.
+- **Different orders:** if the same `eventId` arrives for two different orders at the same moment, `UNIQUE (event_id)` rejects the second insert. The service rolls back, reads the stored event and returns `409`.
+- **State guard:** the status update also re-checks the expected current status, so a missing lock could never pay an order twice. A test that removed the order lock got `500`s, not double payments.
+
+Every processed or duplicate event returns **200** (`{ eventId, orderId, outcome, orderStatus, duplicate }`), so the provider stops retrying. `PAYMENT_BUSY` (503) is returned if the order stays locked for more than 5 s.
+
+### Outcomes
+
+| Order state when the event is processed | Event | Outcome | Order becomes | Stock effect |
+| --- | --- | --- | --- | --- |
+| `pending`, before `expires_at`, amount = total | captured | `paid` | `paid` (`paid_at` = decision time) | Keeps its reservation. Physical stock unchanged until pickup. |
+| `pending`, before `expires_at`, amount ≠ total | captured | `amount_mismatch` | `needs_review` | Reservation released (`needs_review` holds nothing). Nothing re-reserved or decremented. |
+| `pending` past `expires_at`, or `expired` | captured | `late_payment` | `needs_review` (`expired_at` recorded) | Nothing re-reserved; units may already belong to another order |
+| `paid` | captured | `already_paid` | unchanged | none |
+| `needs_review` or `collected` | captured | `order_not_payable` | unchanged | none |
+| any | failed | `payment_failed` | unchanged | none |
+
+`payment_events.detail` stores the reason, for example `Paid 3999 paise; order total is 4000 paise.`
+
+**No refunds are issued.** There is no refund mechanism. `late_payment`, `amount_mismatch` and `already_paid` events are recorded for a person to resolve with the provider.
+
 ## Database schema
 
 `products` (migration `0002_create_products.sql`):
@@ -206,6 +312,17 @@ The rules are enforced by PostgreSQL itself, so invalid data is rejected no matt
 | `order_items` | `order_id`, `product_id` | Foreign keys. One line per product per order (`UNIQUE`) |
 | | `quantity INTEGER` | `> 0` |
 | | `unit_price_paise INTEGER` | Price **snapshot** at order time. Later price changes do not affect the order. |
+
+`payment_events` (migration `0004_create_payment_events.sql`):
+
+| Column | Rules |
+| ------ | ----- |
+| `event_id TEXT` | **`UNIQUE`**, not blank. This is the idempotency key. |
+| `order_id UUID` | Foreign key to `orders`. Indexed. |
+| `amount_paise INTEGER`, `status TEXT` | As reported (`> 0`; `captured` / `failed`) |
+| `outcome TEXT`, `detail TEXT` | What the application did and why (`CHECK` on the allowed outcomes) |
+| `raw_payload TEXT` | The exact signed body, for audit |
+| `received_at TIMESTAMPTZ` | Default `now()` |
 
 **Status model.** All five statuses exist now, because the stock formula already depends on `paid` and `collected`.
 
@@ -294,6 +411,7 @@ npm install && npm run dev        # proxies /api to http://localhost:4000 by def
 | `npm run typecheck` | `tsc --noEmit`                            |
 | `npm run lint`      | ESLint (type-aware)                       |
 | `npm test`          | Integration tests (needs `TEST_DATABASE_URL`) |
+| `npm run webhook:send -- …` | Send a signed payment webhook (needs `PAYMENT_WEBHOOK_SECRET`) |
 
 | Frontend            | Purpose                       |
 | ------------------- | ----------------------------- |
@@ -309,10 +427,13 @@ Tests use a **real PostgreSQL database** named `pickup_counter_test`. It is crea
 - Before each run, `tests/globalSetup.ts` drops and recreates the test schema, then runs all migrations. Every run therefore proves the migrations work on a fresh database.
 - Tests that need a clean slate call `resetDomainTables()`. It empties **every** application table in one `TRUNCATE`, so foreign keys between tables never block cleanup and future tables are covered automatically. `schema_migrations` is kept.
 - Constraint tests run inside transactions that are always rolled back.
+- **Concurrency tests** use real overlapping transactions. A separate connection holds a row lock, the test waits until `pg_stat_activity` shows every request blocked on it at once, and then releases the lock. The payment service tags its locking queries (`/* payment:lock-order */`, `/* payment:lock-products */`) so the tests can see exactly where requests are waiting.
+- Webhook tests sign with a fixed test-only `PAYMENT_WEBHOOK_SECRET` from `vitest.config.ts`. They compute the HMAC independently of the app's signing code.
 
 ```bash
 # Inside Docker (TEST_DATABASE_URL is already set):
 docker compose exec backend npm test
+docker compose exec backend npx vitest run tests/payments.test.ts   # webhook tests only
 
 # From your machine:
 TEST_DATABASE_URL=postgres://pickup:pickup_dev_password@localhost:5433/pickup_counter_test npm test
@@ -395,6 +516,11 @@ Inside Docker the backend always uses `db:5432`, so this only affects tools runn
 | 21 | Duplicate product IDs in one order are rejected (400), not merged | The client sees exactly what was ordered; no hidden quantity changes. |
 | 22 | Limits: ≤ 20 line items, quantity 1–20, total must fit `INTEGER` paise | Bounds work per request and guarantees safe integer arithmetic. |
 | 23 | `needs_review` holds no stock | A late payment must not silently re-reserve units already sold to someone else; staff resolve it. |
+| 24 | Webhook signature = HMAC-SHA256 over the raw body, header `X-Pickup-Signature: sha256=<hex>`, raw parser only on the webhook path | Verifies the exact bytes; JSON parsing happens only after authentication. |
+| 25 | Idempotency via `UNIQUE (event_id)` in the same transaction as the order update | Durable and race-safe without Redis or memory state; nothing half-applied. |
+| 26 | Payment locks the order row **and** its product rows, then decides with `clock_timestamp()` | Serialises the deadline decision with competing order creation, so a boundary-time payment can never revive units already re-sold. |
+| 27 | Unknown-order events return 404 and are not stored | `payment_events.order_id` is a foreign key; there is no order to attach them to. |
+| 28 | `amount_mismatch` / `late_payment` → `needs_review`; no automatic refund | Money problems need a person; the system never claims a refund it cannot perform. |
 
 ## Security notes
 
