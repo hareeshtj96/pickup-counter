@@ -222,6 +222,125 @@ export async function expireOverdueOrders(): Promise<number> {
   return result.rowCount ?? 0;
 }
 
+export type CollectResult = Order & {
+  /** True when the order had already been collected; nothing was changed. */
+  alreadyCollected: boolean;
+};
+
+/**
+ * Staff confirm pickup: moves a paid order to 'collected' and deducts its
+ * quantities from physical stock, exactly once, in one transaction.
+ *
+ *  1. Lock the order row. Concurrent collections of the same order (and any
+ *     payment for it) queue here.
+ *  2. Re-check the status under the lock: already collected -> acknowledge
+ *     without touching stock; anything other than paid -> 409.
+ *  3. Lock the order's product rows in id order, the same order used by order
+ *     creation and payment, so lock acquisition can never form a cycle.
+ *  4. Verify physical stock covers every item.
+ *  5. Deduct with a guarded UPDATE and check the affected row count.
+ *  6. Mark the order collected (guarded on status = 'paid').
+ *  7. COMMIT. Any failure rolls back stock and status together.
+ *
+ * Availability is unchanged by collection: the units stop counting as a paid
+ * reservation in product_availability at the same moment they leave
+ * stock_quantity.
+ */
+export async function collectOrder(id: string): Promise<CollectResult> {
+  const client = await pool.connect();
+  let clientBroken = false;
+  let alreadyCollected = false;
+  try {
+    await client.query('BEGIN');
+    await client.query(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`);
+
+    // 1. Lock the order.
+    const orderResult = await client.query<{ status: OrderStatus; overdue: boolean }>(
+      `/* collect:lock-order */
+       SELECT status, expires_at <= now() AS overdue FROM orders WHERE id = $1 FOR UPDATE`,
+      [id],
+    );
+    const order = orderResult.rows[0];
+    if (!order) {
+      throw new AppError(404, 'ORDER_NOT_FOUND', 'Order not found.');
+    }
+
+    // 2. Decide from the status read under the lock.
+    if (order.status === 'collected') {
+      alreadyCollected = true;
+      await client.query('ROLLBACK');
+    } else {
+      if (order.status !== 'paid') {
+        const status = order.status === 'pending' && order.overdue ? 'expired' : order.status;
+        throw new AppError(409, 'ORDER_NOT_COLLECTABLE', `Only paid orders can be collected; this order is ${status}.`, {
+          status,
+        });
+      }
+
+      // 3. Lock the products, in the shared deterministic order.
+      const items = await client.query<{ product_id: string; stock_quantity: number; quantity: number }>(
+        `/* collect:lock-products */
+         SELECT p.id AS product_id, p.stock_quantity, oi.quantity
+           FROM order_items oi
+           JOIN products p ON p.id = oi.product_id
+          WHERE oi.order_id = $1
+          ORDER BY p.id
+            FOR UPDATE OF p`,
+        [id],
+      );
+
+      // 4. Physical stock must cover every item.
+      const shortages = items.rows
+        .filter((item) => item.stock_quantity < item.quantity)
+        .map((item) => ({ productId: item.product_id, required: item.quantity, inStock: item.stock_quantity }));
+      if (shortages.length > 0) {
+        throw new AppError(
+          409,
+          'INSUFFICIENT_PHYSICAL_STOCK',
+          'Not enough physical stock to hand over this order.',
+          shortages,
+        );
+      }
+
+      // 5. Deduct, guarded so stock can never go below zero.
+      const deducted = await client.query(
+        `UPDATE products p
+            SET stock_quantity = p.stock_quantity - oi.quantity
+           FROM order_items oi
+          WHERE oi.order_id = $1
+            AND oi.product_id = p.id
+            AND p.stock_quantity >= oi.quantity`,
+        [id],
+      );
+      if (items.rows.length === 0 || deducted.rowCount !== items.rows.length) {
+        throw new Error('Stock deduction did not cover every order item');
+      }
+
+      // 6. Paid -> collected.
+      const collected = await client.query(
+        `UPDATE orders SET status = 'collected', collected_at = clock_timestamp()
+          WHERE id = $1 AND status = 'paid'`,
+        [id],
+      );
+      if (collected.rowCount !== 1) throw new Error('Order changed state while locked');
+
+      await client.query('COMMIT');
+    }
+  } catch (err) {
+    clientBroken = !(await rollback(client));
+    if (isPgError(err) && err.code === PG_LOCK_NOT_AVAILABLE) {
+      throw new AppError(503, 'COLLECTION_BUSY', 'The order is busy. Please try again.');
+    }
+    throw err;
+  } finally {
+    client.release(clientBroken);
+  }
+
+  const result = await getOrder(id);
+  if (!result) throw new Error(`Order ${id} not found after collection`);
+  return { ...result, alreadyCollected };
+}
+
 type OrderRow = {
   id: string;
   status: OrderStatus;

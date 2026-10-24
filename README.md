@@ -10,7 +10,7 @@ A full-stack TypeScript application for ordering items for counter pickup.
 | Tests    | Vitest + Supertest against a real PostgreSQL DB |
 | Runtime  | Docker + Docker Compose                        |
 
-**Status:** Phase 1 (foundation), Phase 2 (product catalog), Phase 3 (orders with 120-second stock reservations) and Phase 4 (signed, idempotent payment webhook) are complete. Pickup is not built yet.
+**Status:** Phase 1 (foundation), Phase 2 (product catalog), Phase 3 (orders with 120-second stock reservations) Phase 4 (signed, idempotent payment webhook) and Phase 5 (pickup collection with exactly-once stock deduction) are complete. The frontend pickup/checkout UI is not built yet.
 
 ---
 
@@ -46,6 +46,7 @@ curl -i -X POST http://localhost:4000/orders -H 'Content-Type: application/json'
   -d '{"items":[{"productId":"a1b2c3d4-0001-4000-8000-000000000001","quantity":2}]}'   # 201, reserves 2 Samosas
 curl -i http://localhost:4000/orders/<id>      # 200, status + expiresInSeconds
 docker compose exec backend npm run webhook:send -- --order <id> --amount <totalPaise>   # signed payment -> paid
+curl -i -X POST http://localhost:4000/orders/<id>/collect   # 200, collected; physical stock deducted once
 docker compose exec backend npm test           # integration tests on pickup_counter_test
 ```
 
@@ -181,6 +182,37 @@ Returns the same shape as above, with the order's **current** status:
 - An unpaid order past `expiresAt` is reported as `expired`, with `expiresInSeconds: 0`, even if nothing has stored that yet. The request also stores it.
 - `expiresInSeconds` is `null` for `paid`, `needs_review` and `collected` orders, because the deadline no longer applies to them.
 - 404 `ORDER_NOT_FOUND` for an unknown id; 400 for a malformed id.
+
+### `POST /orders/:id/collect`
+
+Staff confirm that the customer has physically collected a **paid** order. It is also served at `/api/orders/:id/collect`. No body is needed; any body fields are rejected with 400. There is no PIN or staff authentication, because the requirements define none.
+
+| Order state | Response |
+| --- | --- |
+| `paid` | **200**, the order (same shape as `GET /orders/:id`) with `status: "collected"` and `"alreadyCollected": false`. Each item's quantity is deducted from physical stock. |
+| `collected` | **200**, the order with `"alreadyCollected": true`. Nothing changes, so retries and double-clicks are harmless. |
+| `pending`, `expired` (stored, or unpaid past `expiresAt`), `needs_review` | **409** `ORDER_NOT_COLLECTABLE`, with `details: { status }` |
+| `paid`, but the shelf holds less than an item's quantity | **409** `INSUFFICIENT_PHYSICAL_STOCK`, with `details: [{ productId, required, inStock }]`. Nothing changes. |
+| unknown id | **404** `ORDER_NOT_FOUND` |
+| malformed id or body field | **400** `VALIDATION_ERROR` |
+| rows locked > 5 s | **503** `COLLECTION_BUSY`. Safe to retry. |
+
+**How stock is deducted exactly once.** Everything runs in one transaction (`collectOrder` in `orders.service.ts`):
+
+1. Lock the order row (`FOR UPDATE`). Concurrent collections of the same order queue here, and so do payments for it.
+2. Re-read the status under the lock. If it is `collected`, acknowledge without touching stock. If it is anything other than `paid`, return 409.
+3. Lock the order's product rows in **id order**. Order creation and payment use the same order, so lock acquisition can never form a deadlock cycle.
+4. Check that physical stock covers every item.
+5. `UPDATE products … SET stock_quantity = stock_quantity - quantity … WHERE stock_quantity >= quantity`, then check that the affected row count equals the item count.
+6. `UPDATE orders SET status = 'collected', collected_at = clock_timestamp() WHERE id = $1 AND status = 'paid'`, and check that exactly 1 row changed.
+7. `COMMIT`. Any failure rolls back the stock and the status together.
+
+Tests prove the layers:
+- **Lock and guard together:** two simultaneous collections of one order give one `false` and one `true`, with stock deducted once.
+- **Removing the lock:** the status guard still prevents a double deduction, and the loser gets a 500.
+- **Removing both:** stock was deducted **twice** in 9 out of 10 races.
+
+No migration was needed: `orders.collected_at` and its `CHECK` constraints already existed from migration 0003.
 
 ## Payment webhook
 
@@ -332,9 +364,13 @@ The rules are enforced by PostgreSQL itself, so invalid data is rejected no matt
 | `paid` | Yes, until collected | Payment (Phase 4) |
 | `expired` | No | Expiry (this phase) |
 | `needs_review` | No. For example, payment arrived after expiry; a person decides. | Payment (Phase 4) |
-| `collected` | No. Physical stock was decremented at pickup. | Pickup (later phase) |
+| `collected` | No. Physical stock was decremented at pickup. | `POST /orders/:id/collect` (Phase 5), only from `paid` |
 
-**Physical stock vs. reservations.** `products.stock_quantity` changes only at collection, which happens in a later phase. Creating an order does not touch it. Reservations are derived from orders in the `product_availability` view:
+**Physical stock vs. reservations.** `products.stock_quantity` changes only at collection (`POST /orders/:id/collect`). Creating or paying for an order does not touch it.
+- Collection moves units from "reserved by a paid order" to "gone from the shelf" in one transaction, so availability does not change and nothing is subtracted twice.
+- Lifecycle for an order of 3 from stock 10:
+  - pending or paid: `stock 10 · reserved 3 · available 7`
+  - collected: `stock 7 · reserved 0 · available 7` Reservations are derived from orders in the `product_availability` view:
 
 ```
 available_units = max(stock_quantity − Σ quantity of (pending AND expires_at > now()) OR paid orders, 0)
@@ -521,6 +557,10 @@ Inside Docker the backend always uses `db:5432`, so this only affects tools runn
 | 26 | Payment locks the order row **and** its product rows, then decides with `clock_timestamp()` | Serialises the deadline decision with competing order creation, so a boundary-time payment can never revive units already re-sold. |
 | 27 | Unknown-order events return 404 and are not stored | `payment_events.order_id` is a foreign key; there is no order to attach them to. |
 | 28 | `amount_mismatch` / `late_payment` → `needs_review`; no automatic refund | Money problems need a person; the system never claims a refund it cannot perform. |
+| 29 | Collection locks the order row, re-checks status, locks products in id order, guarded deduction + guarded status update, one transaction | Exactly-once physical stock deduction under concurrency; same lock order as creation and payment, so no deadlocks. |
+| 30 | Repeat collection returns 200 with `alreadyCollected: true` | Idempotent for staff retries and double-clicks; mirrors the webhook's `duplicate: true`. |
+| 31 | Shelf shortage at pickup → 409 `INSUFFICIENT_PHYSICAL_STOCK`, order stays `paid` | A write-off after payment must not silently hand over a partial order; staff resolve it. |
+| 32 | No new migration for Phase 5 | `collected_at` and its `CHECK` constraints already existed (0003); old migrations are never edited. |
 
 ## Security notes
 

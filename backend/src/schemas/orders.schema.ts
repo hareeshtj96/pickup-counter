@@ -45,3 +45,6 @@ export const orderIdParamsSchema = z.object({
 });
 
 export type OrderIdParams = z.infer<typeof orderIdParamsSchema>;
+
+// Collection needs no input beyond the order id; any body fields are rejected.
+export const collectOrderBodySchema = z.object({}).strict().optional();
