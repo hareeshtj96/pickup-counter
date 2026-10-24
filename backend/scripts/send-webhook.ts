@@ -4,6 +4,11 @@
  *
  *   npm run webhook:send -- --order <orderId> --amount <paise> [--status captured|failed]
  *                           [--event-id <id>] [--repeat <n>] [--url <webhook url>]
+ *                           [--signature-format hex|sha256]
+ *
+ * The signature is sent in the X-Signature header: the bare hex HMAC-SHA256
+ * digest (default, --signature-format hex) or `sha256=<hex>` (--signature-format
+ * sha256). The server accepts both.
  *
  * Reads PAYMENT_WEBHOOK_SECRET from the environment; the secret is never printed.
  * Reuse --event-id, or pass --repeat 2, to resend the same event and observe
@@ -15,7 +20,7 @@ import { SIGNATURE_HEADER, signWebhookBody } from '../src/payments/signature.js'
 
 const USAGE =
   'Usage: npm run webhook:send -- --order <orderId> --amount <paise> [--status captured|failed] ' +
-  '[--event-id <id>] [--repeat <n>] [--url <url>]';
+  '[--event-id <id>] [--repeat <n>] [--url <url>] [--signature-format hex|sha256]';
 
 function fail(message: string): never {
   console.error(message);
@@ -30,6 +35,7 @@ const { values } = parseArgs({
     'event-id': { type: 'string' },
     repeat: { type: 'string', default: '1' },
     url: { type: 'string', default: 'http://localhost:4000/payments/webhook' },
+    'signature-format': { type: 'string', default: 'hex' },
   },
 });
 
@@ -42,10 +48,13 @@ if (!Number.isFinite(amountPaise)) fail('--amount must be a number of paise.');
 const repeat = Number(values.repeat);
 if (!Number.isInteger(repeat) || repeat < 1) fail('--repeat must be a positive integer.');
 
+const format = values['signature-format'];
+if (format !== 'hex' && format !== 'sha256') fail('--signature-format must be "hex" or "sha256".');
+
 const eventId = values['event-id'] ?? `evt_${randomUUID()}`;
 // Sign exactly the bytes that are sent.
 const body = JSON.stringify({ eventId, orderId: values.order, amountPaise, status: values.status });
-const signature = signWebhookBody(secret, body);
+const signature = signWebhookBody(secret, body, format);
 
 console.log(`POST ${values.url}  eventId=${eventId}  amountPaise=${amountPaise}  status=${values.status}`);
 

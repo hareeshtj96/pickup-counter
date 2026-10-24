@@ -571,25 +571,45 @@ describe('concurrency (real overlapping transactions)', () => {
     const other = new pg.Client({ connectionString: testDatabaseUrl });
     await other.connect();
     await other.query('BEGIN');
+    // PostgreSQL aborts whichever deadlocked session's deadlock_timeout check runs
+    // first (1 s by default, started when that session begins to wait). That is a
+    // race: under load, this test's session was sometimes chosen as the victim, its
+    // locks were released at once, and the order then succeeded (201). Delaying this
+    // session's check makes the order's transaction the only one that can detect the
+    // cycle in time, without changing what is tested. (deadlock_timeout needs a
+    // superuser, which the Compose database user is.)
+    await other.query("SET LOCAL deadlock_timeout = '30s'");
     await other.query('SELECT 1 FROM products WHERE id = $1 FOR UPDATE', [high]);
     try {
+      const startedAt = Date.now();
       const pending = request(baseUrl)
         .post('/orders')
         .send({ items: [{ productId: low, quantity: 1 }, { productId: high, quantity: 1 }] })
         .then((res) => res);
       await waitUntil(async () => (await blockedOrderTransactions()) === 1, 4_000);
 
-      // Close the cycle. The order transaction has waited longer, so its
-      // deadlock check (deadlock_timeout) runs first and PostgreSQL aborts it.
-      const otherWaits = other.query('SELECT 1 FROM products WHERE id = $1 FOR UPDATE', [low]);
+      // Close the cycle: this session now waits for `low`, which the order holds.
+      // The result is captured instead of left as a bare promise, so a deadlock
+      // error on this session fails the test with a clear message.
+      const otherWaits = other
+        .query('SELECT 1 FROM products WHERE id = $1 FOR UPDATE', [low])
+        .then(
+          () => 'granted',
+          (err: { code?: string }) => `error ${err.code ?? 'unknown'}`,
+        );
       const res = await pending;
-      await otherWaits; // granted once the aborted order transaction released `low`
+      const elapsedMs = Date.now() - startedAt;
 
+      // Granted only once the aborted order transaction released `low`.
+      expect(await otherWaits).toBe('granted');
       expect(res.status).toBe(503);
       expect(res.body).toEqual({
         error: { code: 'RESERVATION_BUSY', message: 'The counter is busy. Please try again.' },
       });
       expect(res.text).not.toMatch(/deadlock|40P01/i);
+      // The order's lock_timeout is 5 s, so a response sooner than that cannot be a
+      // lock timeout: it proves the 503 came from PostgreSQL's deadlock detection.
+      expect(elapsedMs).toBeLessThan(5_000);
     } finally {
       await other.query('ROLLBACK').catch(() => undefined);
       await other.end();

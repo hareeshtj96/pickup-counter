@@ -4,12 +4,15 @@ import { SIGNATURE_HEADER, checkWebhookSignature } from '../payments/signature.j
 
 const REJECTIONS = {
   missing: ['SIGNATURE_MISSING', `Missing ${SIGNATURE_HEADER} header.`],
-  malformed: ['SIGNATURE_MALFORMED', `${SIGNATURE_HEADER} must be "sha256=<64 hex characters>".`],
+  malformed: [
+    'SIGNATURE_MALFORMED',
+    `${SIGNATURE_HEADER} must be a 64-character lowercase hex HMAC-SHA256 digest, optionally prefixed with "sha256=".`,
+  ],
   invalid: ['SIGNATURE_INVALID', 'Webhook signature does not match.'],
 } as const;
 
 /**
- * Rejects the request (401) unless its X-Pickup-Signature header is a valid
+ * Rejects the request (401) unless its X-Signature header is a valid
  * HMAC-SHA256 of the raw body. Requires `express.raw()` to have stored the
  * unparsed body as a Buffer in `req.body` (see app.ts). Nothing about the
  * payment is looked at before this passes.

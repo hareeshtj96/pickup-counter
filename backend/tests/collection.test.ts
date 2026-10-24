@@ -51,7 +51,8 @@ async function pay(order: { id: string; totalPaise: number }, expectedOutcome = 
   const res = await request(app)
     .post('/payments/webhook')
     .set('Content-Type', 'application/json')
-    .set('X-Pickup-Signature', `sha256=${createHmac('sha256', SECRET).update(raw).digest('hex')}`)
+    // The `sha256=<hex>` form; payments.test.ts mostly uses the bare hex form.
+    .set('X-Signature', `sha256=${createHmac('sha256', SECRET).update(raw).digest('hex')}`)
     .send(raw);
   expect(res.body).toMatchObject({ outcome: expectedOutcome });
 }
@@ -391,6 +392,46 @@ describe('POST /orders/:id/pickup-claim (the route named in the brief)', () => {
     expect(bare.status).toBe(415);
     expect((await orderRow(paid.id))?.status).toBe('paid');
     expect((await stock(samosa))?.stock_quantity).toBe(10);
+  });
+
+  // An "expired order" is an unpaid reservation whose 120 seconds have run out.
+  it.each([
+    ['an overdue reservation whose expiry has not been stored yet', false],
+    ['an order already stored as expired', true],
+  ])('rejects %s with 409 ORDER_NOT_COLLECTABLE and changes nothing', async (_label, stored) => {
+    const samosa = await createProduct('Samosa', 2000, 10);
+    const order = await createOrder([{ productId: samosa, quantity: 3 }]);
+    await expireReservation(order.id);
+    if (stored) {
+      await request(app).get(`/orders/${order.id}`); // a status read persists 'expired'
+    }
+    expect((await orderRow(order.id))?.status).toBe(stored ? 'expired' : 'pending');
+    const before = await orderRow(order.id);
+
+    const res = await claim(order.id);
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({
+      error: {
+        code: 'ORDER_NOT_COLLECTABLE',
+        message: 'Only paid orders can be collected; this order is expired.',
+        details: { status: 'expired' },
+      },
+    });
+    expect(await orderRow(order.id)).toEqual(before); // status and timestamps unchanged
+    expect(await stock(samosa)).toEqual({ stock_quantity: 10, reserved_units: 0, available_units: 10 });
+  });
+
+  it('still lets a paid order be claimed after its original reservation deadline has passed', async () => {
+    const samosa = await createProduct('Samosa', 2000, 10);
+    const order = await paidOrder([{ productId: samosa, quantity: 3 }]);
+    await expireReservation(order.id); // payment keeps the reservation; the deadline no longer applies
+
+    const res = await claim(order.id);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ status: 'collected', alreadyCollected: false });
+    expect(await stock(samosa)).toEqual({ stock_quantity: 7, reserved_units: 0, available_units: 7 });
   });
 });
 

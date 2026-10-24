@@ -3,16 +3,30 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 /**
  * Webhook signature scheme:
  *
- *   X-Pickup-Signature: sha256=<64 lowercase hex characters>
+ *   X-Signature: <64 lowercase hex characters>
+ *   X-Signature: sha256=<64 lowercase hex characters>     (also accepted)
  *
  * where the hex value is HMAC-SHA256(PAYMENT_WEBHOOK_SECRET, raw request body
  * bytes). The body is signed exactly as sent; it is never re-serialised.
+ *
+ * Both value forms are accepted because the original assignment's value format
+ * could not be checked. They are validated identically and strictly: exactly 64
+ * lowercase hex characters, an optional lowercase `sha256=` prefix, nothing else.
+ * X-Signature is the only header read; any other signature header is ignored.
  */
-export const SIGNATURE_HEADER = 'x-pickup-signature';
-const SIGNATURE_FORMAT = /^sha256=([0-9a-f]{64})$/;
+export const SIGNATURE_HEADER = 'X-Signature';
+const SIGNATURE_FORMAT = /^(?:sha256=)?([0-9a-f]{64})$/;
 
-export function signWebhookBody(secret: string, rawBody: Buffer | string): string {
-  return `sha256=${createHmac('sha256', secret).update(rawBody).digest('hex')}`;
+export type SignatureFormat = 'hex' | 'sha256';
+
+/** Signs `rawBody`: the bare hex digest, or `sha256=` + hex digest. */
+export function signWebhookBody(
+  secret: string,
+  rawBody: Buffer | string,
+  format: SignatureFormat = 'hex',
+): string {
+  const hex = createHmac('sha256', secret).update(rawBody).digest('hex');
+  return format === 'sha256' ? `sha256=${hex}` : hex;
 }
 
 export type SignatureCheck = 'valid' | 'missing' | 'malformed' | 'invalid';

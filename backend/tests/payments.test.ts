@@ -24,8 +24,14 @@ type Payload = { eventId: string; orderId: string; amountPaise: number; status: 
 
 // ---------- signing (computed here independently of the app's helper) ----------
 
+/** The bare 64-character hex digest, the form most tests send. */
 function sign(rawBody: string, secret = SECRET): string {
-  return `sha256=${createHmac('sha256', secret).update(rawBody).digest('hex')}`;
+  return createHmac('sha256', secret).update(rawBody).digest('hex');
+}
+
+/** The same digest in the `sha256=<hex>` form; the server accepts both. */
+function signPrefixed(rawBody: string, secret = SECRET): string {
+  return `sha256=${sign(rawBody, secret)}`;
 }
 
 let eventCounter = 0;
@@ -37,7 +43,7 @@ function payload(orderId: string, amountPaise: number, overrides: Partial<Payloa
 /** Sends `body` byte-for-byte; signs it unless a signature (or null for none) is given. */
 function sendRaw(rawBody: string, signature: string | null = sign(rawBody), target: Parameters<typeof request>[0] = app) {
   const req = request(target).post('/payments/webhook').set('Content-Type', 'application/json');
-  if (signature !== null) req.set('X-Pickup-Signature', signature);
+  if (signature !== null) req.set('X-Signature', signature);
   return req.send(rawBody);
 }
 
@@ -148,7 +154,34 @@ describe('signature verification', () => {
     const res = await request(app)
       .post('/api/payments/webhook')
       .set('Content-Type', 'application/json')
-      .set('X-Pickup-Signature', sign(raw))
+      .set('X-Signature', sign(raw))
+      .send(raw);
+    expect(res.status).toBe(200);
+  });
+
+  it.each([
+    ['the bare 64-character hex digest', sign],
+    ['sha256= followed by the hex digest', signPrefixed],
+  ])('accepts %s in X-Signature', async (_label, makeSignature) => {
+    const { orderId, total } = await pendingOrder();
+    const event = payload(orderId, total);
+    const raw = JSON.stringify(event);
+
+    const res = await sendRaw(raw, makeSignature(raw));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ outcome: 'paid', orderStatus: 'paid', duplicate: false });
+    expect((await orderRow(orderId)).status).toBe('paid');
+    expect(await events(orderId)).toHaveLength(1);
+  });
+
+  it('reads the header case-insensitively', async () => {
+    const { orderId, total } = await pendingOrder();
+    const raw = JSON.stringify(payload(orderId, total));
+    const res = await request(app)
+      .post('/payments/webhook')
+      .set('Content-Type', 'application/json')
+      .set('x-signature', sign(raw))
       .send(raw);
     expect(res.status).toBe(200);
   });
@@ -192,6 +225,20 @@ describe('signature verification', () => {
       await expectUntouched();
     });
 
+    it.each([
+      ['X-Pickup-Signature (the former header)', 'X-Pickup-Signature'],
+      ['an unrelated signature header', 'X-Hub-Signature-256'],
+    ])('a valid signature sent only in %s is ignored -> 401 SIGNATURE_MISSING', async (_label, headerName) => {
+      const res = await request(app)
+        .post('/payments/webhook')
+        .set('Content-Type', 'application/json')
+        .set(headerName, signPrefixed(raw))
+        .send(raw);
+      expect(res.status).toBe(401);
+      expect((res.body as ErrorResponse).error.code).toBe('SIGNATURE_MISSING');
+      await expectUntouched();
+    });
+
     it('signature from the wrong secret -> 401 SIGNATURE_INVALID', async () => {
       const res = await sendRaw(raw, sign(raw, 'some-other-secret-that-is-long-enough!!'));
       expect(res.status).toBe(401);
@@ -208,14 +255,20 @@ describe('signature verification', () => {
     });
 
     it.each([
-      ['no scheme', () => createHmac('sha256', SECRET).update(raw).digest('hex')],
-      ['wrong scheme', () => sign(raw).replace('sha256=', 'sha1=')],
-      ['non-hex characters', () => `sha256=${'z'.repeat(64)}`],
+      ['wrong scheme', () => `sha1=${sign(raw)}`],
+      ['upper-case scheme', () => `SHA256=${sign(raw)}`],
+      ['repeated scheme', () => `sha256=sha256=${sign(raw)}`],
+      ['non-hex characters', () => 'z'.repeat(64)],
+      ['non-hex characters after the scheme', () => `sha256=${'z'.repeat(64)}`],
       ['too short', () => sign(raw).slice(0, -2)],
+      ['too short after the scheme', () => signPrefixed(raw).slice(0, -2)],
       ['too long', () => `${sign(raw)}00`],
-      ['uppercase hex', () => sign(raw).toUpperCase().replace('SHA256=', 'sha256=')],
-      ['base64 digest', () => `sha256=${createHmac('sha256', SECRET).update(raw).digest('base64')}`],
-      ['empty value', () => 'sha256='],
+      ['too long after the scheme', () => `${signPrefixed(raw)}00`],
+      ['upper-case hex', () => sign(raw).toUpperCase()],
+      ['upper-case hex after the scheme', () => `sha256=${sign(raw).toUpperCase()}`],
+      ['base64 digest', () => createHmac('sha256', SECRET).update(raw).digest('base64')],
+      ['base64 digest after the scheme', () => `sha256=${createHmac('sha256', SECRET).update(raw).digest('base64')}`],
+      ['scheme only', () => 'sha256='],
     ])('malformed signature (%s) -> 401 SIGNATURE_MALFORMED', async (_label, makeSignature) => {
       const res = await sendRaw(raw, makeSignature());
       expect(res.status).toBe(401);

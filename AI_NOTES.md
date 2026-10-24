@@ -14,14 +14,15 @@ How AI tools were used to build Pickup Counter, what worked, and where the AI go
 - **Phases with explicit acceptance criteria.** The project was built in phases: foundation, catalog, reservations, test-database safety, payment webhook, pickup, frontend, final audit, audit fixes, and brief compliance. Most phase prompts stated acceptance criteria and required that no check be reported as passing unless it had actually been run.
 - **Plan before code, where it mattered.** For several phases (the foundation, pickup collection, the audit fixes, and brief compliance), Claude Code presented a plan for approval before changing code. Where a decision was genuinely the author's, Claude Code asked rather than assumed.
 - **The author made the product decisions**, including:
-  - whether a repeated pickup should return 200 or 409 (first 200; later `pickup-claim` with 409, to match the brief)
+  - whether a repeated pickup should return 200 or 409 (first 200; later `pickup-claim` with 409, to match the requirement given to the author)
   - keeping the default PostgreSQL host port at 5433
   - how to resolve the local port conflict
   - which AI error to document here
 - **Commits at milestones, made by the author.** The work was developed and reviewed in phases, and the author committed at milestones.
-  - The history has six commits, from "Initialised Project Foundation" to "Pickup counter frontend complete". All are authored by the author, with no AI co-author lines.
-  - The catalog phase and the test-database hardening share one commit.
-  - When these notes were written, the final audit, its fixes, the `pickup-claim` work and these notes were still uncommitted.
+  - As of commit `bc89333` ("Feat: Project final tests done"), the history has seven commits, from "Initialised Project Foundation" (`756d3f5`) to `bc89333`. All seven are authored by the author, and none contains an AI co-author line.
+  - The catalog phase and the test-database hardening share one commit (`ff4e7d0`).
+  - `bc89333` contains, together: these notes, `docs/FINAL_AUDIT.md`, the `pickup-claim` route and controller, the JSON content-type middleware and its tests, the Docker Compose port-binding change, and the README changes of that time.
+  - Work made after `bc89333` is not covered by this description: the webhook header and signature-format alignment, the expired-order `pickup-claim` tests, and the documentation restructure (`docs/TECHNICAL_DETAILS.md`, `docs/TESTING.md`) and corrections. Check `git log` for how those were committed.
   - Claude Code did not commit or push.
 - **Claims were backed by evidence.**
   - Reported test and build results came from commands that were actually executed. Anything the audit could not execute is labelled as inferred or historical.

@@ -4,6 +4,8 @@ Audit date: 2026-10-24. Audited commit: `f118639` (working tree clean at the sta
 
 Every result below comes from a command run during this audit, unless it is explicitly marked *previously executed* (earlier phases) or *inferred* (code reading only).
 
+> **Historical figures.** The test counts (**165 backend / 46 frontend**), file line numbers and header names in this document are **as of this audit (2026-10-24, commit `f118639`)**. They predate the `pickup-claim` route, the extra concurrency tests, the content-type tests and the webhook header change. The **latest reported results** are in [Pre-submission follow-up](#pre-submission-follow-up-after-bc89333) near the end of this document. Where the two differ, the latest results apply.
+
 ---
 
 ## 1. Executive summary
@@ -243,7 +245,7 @@ The approved fixes were applied on top of `f118639`. They are **uncommitted**. E
 
 ## Brief compliance follow-up (2026-10-24)
 
-The employer brief was supplied after this audit. Checking against it found three gaps, now closed (uncommitted):
+Requirements stated by the author as coming from the employer's brief were supplied after this audit. (The brief itself is not in the repository; see §10.) Checking against them found three gaps, closed in commit `bc89333`:
 
 | Brief requirement | Gap found | Resolution |
 | --- | --- | --- |
@@ -253,9 +255,57 @@ The employer brief was supplied after this audit. Checking against it found thre
 
 The local port conflict (F15) is resolved on this machine with a git-ignored `.env` (`POSTGRES_HOST_PORT=5434`). The repository default stays at 5433.
 
+## Pre-submission follow-up (after `bc89333`)
+
+A further pre-submission audit found the items below. Everything in this section was made after commit `bc89333`.
+
+| ID | Finding | Resolution |
+| --- | --- | --- |
+| F16 | The webhook accepted only `X-Pickup-Signature: sha256=<hex>`, a name and format chosen by this project. The author reported that the assignment specifies `X-Signature`. The value format could not be checked, because the brief is unavailable. | `X-Signature` is now the **only** header read. Its value may be the bare 64-character lowercase hex HMAC-SHA256 digest or `sha256=` + that digest, validated strictly. Raw-body signing, `timingSafeEqual`, 401-before-any-state-change, idempotency and all concurrency protections are unchanged. The signed sender gained `--signature-format hex\|sha256`. Tests and docs updated. |
+| F17 | No test covered `pickup-claim` on an expired order. | Added two cases (an overdue reservation whose expiry is not stored yet, and an order stored as `expired`). Both assert 409 `ORDER_NOT_COLLECTABLE` and an unchanged order row and stock. A third test confirms that a **paid** order stays claimable after its original deadline. |
+| F18 | The README claimed full compliance with a brief that is not in the repository; `AI_NOTES.md` described the commit history as of an earlier state; the "cart" was not described as in-page. | README status reworded; `AI_NOTES.md` rewritten from verified Git history; the in-page cart is described in the README and `docs/TECHNICAL_DETAILS.md`. |
+
+**Mutation checks** (a safeguard removed temporarily, the relevant test run, the file restored byte for byte):
+
+| Mutation | Result |
+| --- | --- |
+| Header constant reverted to `X-Pickup-Signature` | the `X-Signature` tests failed, including the valid-payment, `/api` and both format-acceptance tests (the output shown listed the first four) |
+| Hex class loosened to accept upper-case digits | both "upper-case hex" malformed tests failed |
+| A claim allowed on an overdue unpaid order | both new expired-order `pickup-claim` tests failed |
+
+### Latest verified results
+
+Run after the changes above, with the guarded test database (`pickup_counter_test`, disposable-test marker present) confirmed immediately beforehand:
+
+| Check | Result |
+| --- | --- |
+| Backend, full suite (`docker compose exec backend npm test`) | **206 tests, 11 files.** One full run reported **205/206**: the test "reports a deadlock as a retryable 503 without database details, leaving nothing behind" failed. Its cause was found and the test was made deterministic (see **Resolved: intermittent deadlock test** below). After that change the suite passed **206/206** in three consecutive normal runs and once under heavy artificial CPU load (451 s instead of about 60 s). |
+| Frontend (`cd frontend && npm test`) | **47/47**, 2 files |
+| Backend and frontend typecheck, lint, build | all pass |
+| Live checks of the documented examples | The sender accepted both `hex` and `sha256` formats. A hand-signed `curl` was accepted in both forms. A tampered digest, `SHA256=` prefix and `X-Pickup-Signature` alone each returned 401. None stored an event. |
+| Development data (14 orders, 5 products, 12 events) | the same before and after the test runs |
+
+Compared with the historical counts above, the backend suite grew from 165 to 206 tests and the frontend suite from 46 to 47.
+
+**Resolved: intermittent deadlock test.** The test "reports a deadlock as a retryable 503…" (`backend/tests/orders.test.ts`) failed once in a full run.
+
+- **Cause (established by experiment, not assumed):**
+  - The test makes a real deadlock between the API's order transaction and a second session of its own. PostgreSQL aborts whichever of the two sessions runs its `deadlock_timeout` check (1 s) first.
+  - The test assumed that is always the API session. Under CPU load it was sometimes the test's own session (error `40P01`). PostgreSQL releases an aborted session's locks at once, so the API then took the lock and **created the order (201)**, and the `503` assertion failed after about 1.3 s.
+  - A temporary probe replayed the scenario, recording each outcome. At normal load, 60 of 60 runs went as designed. Under heavy load, **3 of 210** runs ended with the test session as the victim (`api=201`, `other=40P01`). Production code was not involved: the application behaved correctly in every case.
+- **Fix (test only):** the test's own session now runs `SET LOCAL deadlock_timeout = '30s'`, so only the API's session can detect the cycle in time. Everything the test asserted is kept, and two checks were added:
+  - the test session's lock request must be *granted*, so a `40P01` on the wrong session fails with a clear message instead of an unhandled rejection
+  - the response must arrive in under 5 s. The order's `lock_timeout` is 5 s, so a faster response proves the 503 came from deadlock detection and not from a lock timeout.
+- **Evidence after the fix:**
+  - the probe with the fix: **150 of 150** as designed, under the same heavy load
+  - the real test: 12 of 12 at normal load and **25 of 25** under heavy load
+  - the full suite: 206/206 in three consecutive normal runs and once under heavy load
+  - the mutation check (`40P01` removed from the mapping) still makes the test fail (`expected 500 to be 503`)
+- **Residual risk (low):** the test needs a superuser (true for the Compose database user), and it assumes the second session's lock request arrives within 1 s of the order starting to wait. If it does not, the order times out at 5 s instead, and the new time check fails the test rather than letting it pass silently.
+
 ## 10. Submission readiness verdict
 
-**READY WITH LIMITATIONS**, against the requirements available in this repository and session:
+**READY WITH LIMITATIONS**, against the requirements documented in this repository and stated in the author's messages. That is not a verification against the original assignment text, which is not available:
 - Every mandatory requirement listed in §2 is satisfied, with test, command or live-run evidence.
 - There are no Critical or High findings.
 - The two Medium findings (F1, F2) concern the local Docker network exposure and have 3-line fixes.
